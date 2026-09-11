@@ -15,6 +15,16 @@ Display modes (``backendOptions={'jupyter_backend': ...}``)
     installed)
     Renders inline as a Jupyter widget.  Falls back to ``"native"``
     silently when ``jupyter_rfb`` is not installed.
+``"image"``
+    Renders fully offscreen (typically combined with
+    ``backendOptions={'app_backend': 'egl'}`` or ``'osmesa'`` for a headless
+    GPU/software GL context -- no X server, no native window) and pushes each
+    frame inline as a plain Jupyter image-display update. Unlike
+    ``"notebook"``, this does not depend on an ``ipywidgets``/``jupyter_rfb``
+    comm channel staying alive between kernel and browser, which does not
+    reliably come up through a VS Code remote-SSH Jupyter connection even
+    though the same kernel process renders fine headless. Use this when
+    ``"notebook"`` mode shows nothing (or hangs) over such a connection.
 
 Update pattern
 --------------
@@ -515,6 +525,38 @@ def _in_ipykernel() -> bool:
         return False
 
 
+def _sharedMarkerBounds(fluid, boundary, opts):
+    """`math.getSharedBounds` for the two marker sets, honouring Hide/Passive.
+
+    A set that is hidden, drawn passive (flat grey), or empty contributes
+    nothing to the norm -- it is not coloured by the quantity, so letting its
+    values set the range would stretch the map for no visible gain.
+    """
+    from ..math import getSharedBounds  # noqa: PLC0415
+
+    coloured = (VisualizeOptions.Hide, VisualizeOptions.Passive)
+    fluidQuantities = (fluid.quantities
+                       if opts.fluidVisualization not in coloured
+                       and fluid.positions.shape[0] > 0 else None)
+    boundaryQuantities = (boundary.quantities
+                          if opts.boundaryVisualization not in coloured
+                          and boundary.positions.shape[0] > 0 else None)
+    return getSharedBounds(fluidQuantities, boundaryQuantities, opts)
+
+
+def _no_display_available() -> bool:
+    """True on a Linux session with neither X11 nor Wayland reachable.
+
+    The signal vispy's own GUI-toolkit probe (glfw/Qt/...) has no way to
+    check for cheaply up front -- it just tries to open a window and raises.
+    Non-Linux platforms are left alone: macOS/Windows native windowing
+    doesn't depend on `DISPLAY`, and EGL is a Linux-specific escape hatch.
+    """
+    return (_sys.platform.startswith("linux")
+            and not _os.environ.get("DISPLAY")
+            and not _os.environ.get("WAYLAND_DISPLAY"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Backend implementation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -542,6 +584,7 @@ class VispyBackend(AbstractBackend):
         self._figure_title: str = ""
         self._jupyter_mode: str = "native"
         self._app_backend: Optional[str] = None
+        self._image_display_handle: Any = None
         self._window_pos: Optional[Tuple[int, int]] = None
         self._force_primary_window: bool = False
         self._point_size: float = 10.0
@@ -579,9 +622,23 @@ class VispyBackend(AbstractBackend):
 
         # In script/native mode we allow pinning the vispy app backend (e.g.
         # PyQt5) to match standalone vispy examples and avoid backend-specific
-        # window mapping quirks.
+        # window mapping quirks. "image" mode needs this too -- that's how a
+        # headless EGL/OSMesa context gets selected instead of whatever GUI
+        # toolkit vispy would otherwise probe for.
         self._app_backend = opts.get("app_backend", None)
-        if self._jupyter_mode == "native" and self._app_backend:
+        if (self._app_backend is None and self._jupyter_mode in ("native", "image")
+                and _no_display_available()):
+            # vispy's backend choice is a one-shot, process-global decision:
+            # the *first* canvas it ever creates locks it in, even if that
+            # backend then fails to initialise (`RuntimeError: Can only
+            # select a backend once, already using [...]` on any later
+            # `use_app()` call in the same process). So a headless Linux
+            # session -- no DISPLAY, no WAYLAND_DISPLAY -- has to be routed to
+            # EGL's offscreen GL context *before* that first attempt, not
+            # retried afterwards once the default GUI-toolkit probe
+            # (glfw/Qt/...) has already failed for lack of a display.
+            self._app_backend = "egl"
+        if self._jupyter_mode in ("native", "image") and self._app_backend:
             try:
                 vapp.use_app(self._app_backend)
             except Exception:
@@ -727,6 +784,9 @@ class VispyBackend(AbstractBackend):
 
         # ── grid or scatter path ───────────────────────────────────────────────
         markers_fluid, markers_boundary, image_grid = None, None, None
+        # Set on the marker path below; stays None on the grid path, where
+        # the colorbar takes its range from the grid norm instead.
+        fluidQs = boundaryQs = sharedNorm = None
 
         if opts.gridVisualization is not None:
             # ── grid (Image visual) ───────────────────────────────────────────
@@ -752,6 +812,11 @@ class VispyBackend(AbstractBackend):
             image_grid.transform = _image_transform(ox, oy, dx, dy)
 
         else:
+            # One norm across fluid AND boundary -- see `math.getSharedBounds`.
+            # Normalising them separately and drawing both through the same
+            # colormap makes wall colours incomparable to fluid colours.
+            fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
+
             # ── fluid markers ─────────────────────────────────────────────────
             if opts.fluidVisualization != VisualizeOptions.Hide and fluid.positions.shape[0] > 0:
                 pts = _to_3d(fluid.positions)
@@ -760,8 +825,7 @@ class VispyBackend(AbstractBackend):
                         np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (len(pts), 1)
                     )
                 else:
-                    q, norm = getBounds(fluid.quantities, opts)
-                    face_color = _scalars_to_rgba(q, norm, cmap)
+                    face_color = _scalars_to_rgba(fluidQs, sharedNorm, cmap)
                 markers_fluid = visuals.Markers(antialias=0, parent=view.scene)
                 markers_fluid.set_data(
                     pts,
@@ -779,8 +843,7 @@ class VispyBackend(AbstractBackend):
                         np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (len(pts), 1)
                     )
                 else:
-                    q, norm = getBounds(boundary.quantities, opts)
-                    face_color = _scalars_to_rgba(q, norm, cmap)
+                    face_color = _scalars_to_rgba(boundaryQs, sharedNorm, cmap)
                 markers_boundary = visuals.Markers(antialias=0, parent=view.scene)
                 markers_boundary.set_data(
                     pts,
@@ -811,18 +874,10 @@ class VispyBackend(AbstractBackend):
                 if image_grid is not None:
                     _, grid_norm = getBounds(gridQuantity, opts)
                     cb_range = (float(grid_norm.vmin), float(grid_norm.vmax))
-            elif (
-                opts.fluidVisualization not in (VisualizeOptions.Hide, VisualizeOptions.Passive)
-                and fluid.positions.shape[0] > 0
-            ):
-                q, norm = getBounds(fluid.quantities, opts)
-                cb_range = (float(np.nanmin(q)), float(np.nanmax(q)))
-            elif (
-                opts.boundaryVisualization not in (VisualizeOptions.Hide, VisualizeOptions.Passive)
-                and boundary.positions.shape[0] > 0
-            ):
-                q, norm = getBounds(boundary.quantities, opts)
-                cb_range = (float(np.nanmin(q)), float(np.nanmax(q)))
+            elif sharedNorm is not None:
+                # The same norm both marker sets were coloured with, so the bar
+                # describes every particle on screen rather than just the fluid.
+                cb_range = (float(sharedNorm.vmin), float(sharedNorm.vmax))
 
             if cb_range is not None:
                 vmin, vmax = cb_range
@@ -831,7 +886,7 @@ class VispyBackend(AbstractBackend):
                     orientation="right",
                     label="",
                     label_color="black",
-                    clim=(f"{vmin:.4g}", f"{vmax:.4g}"),
+                    clim=(f"{vmin:.6g}", f"{vmax:.6g}"),
                     # padding = (0.5,0)
                 )
                 # Add colorbar into the panel's sub-grid at col 1.
@@ -907,6 +962,10 @@ class VispyBackend(AbstractBackend):
 
         view = panel_state.view
 
+        # Set on the marker path below; stays None on the grid path, where the
+        # colorbar takes its range from the grid norm instead.
+        fluidQs = boundaryQs = sharedNorm = None
+
         if opts.gridVisualization is not None:
             # ── grid update ────────────────────────────────────────────────────
             from ..grid import mapToGrid  # noqa: PLC0415
@@ -935,6 +994,9 @@ class VispyBackend(AbstractBackend):
                 panel_state.image_grid.transform = _image_transform(ox, oy, dx, dy)
 
         else:
+            # One norm across fluid AND boundary -- see `math.getSharedBounds`.
+            fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
+
             # ── fluid markers update ───────────────────────────────────────────
             if opts.fluidVisualization != VisualizeOptions.Hide and fluid.positions.shape[0] > 0:
                 pts = _to_3d(fluid.positions)
@@ -943,8 +1005,7 @@ class VispyBackend(AbstractBackend):
                         np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (len(pts), 1)
                     )
                 else:
-                    q, norm = getBounds(fluid.quantities, opts)
-                    face_color = _scalars_to_rgba(q, norm, cmap)
+                    face_color = _scalars_to_rgba(fluidQs, sharedNorm, cmap)
 
                 if panel_state.markers_fluid is not None:
                     panel_state.markers_fluid.set_data(
@@ -974,8 +1035,7 @@ class VispyBackend(AbstractBackend):
                         np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (len(pts), 1)
                     )
                 else:
-                    q, norm = getBounds(boundary.quantities, opts)
-                    face_color = _scalars_to_rgba(q, norm, cmap)
+                    face_color = _scalars_to_rgba(boundaryQs, sharedNorm, cmap)
 
                 if panel_state.markers_boundary is not None:
                     panel_state.markers_boundary.set_data(
@@ -1013,21 +1073,15 @@ class VispyBackend(AbstractBackend):
                 # gridQuantity was computed in the grid update block above
                 _, grid_norm = getBounds(gridQuantity, opts)
                 new_range = (float(grid_norm.vmin), float(grid_norm.vmax))
-            elif (
-                opts.fluidVisualization not in (VisualizeOptions.Hide, VisualizeOptions.Passive)
-                and fluid.positions.shape[0] > 0
-            ):
-                _, fluid_norm = getBounds(fluid.quantities, opts)
-                new_range = (float(fluid_norm.vmin), float(fluid_norm.vmax))
-            elif (
-                opts.boundaryVisualization not in (VisualizeOptions.Hide, VisualizeOptions.Passive)
-                and boundary.positions.shape[0] > 0
-            ):
-                _, bnd_norm = getBounds(boundary.quantities, opts)
-                new_range = (float(bnd_norm.vmin), float(bnd_norm.vmax))
+            elif sharedNorm is not None:
+                # The same norm both marker sets were coloured with, so the bar
+                # describes every particle on screen rather than just the fluid.
+                new_range = (float(sharedNorm.vmin), float(sharedNorm.vmax))
             if new_range is not None:
                 vmin, vmax = new_range
-                panel_state.colorbar.clim = (f"{vmin:.3g}", f"{vmax:.3g}")
+                # 6 significant digits, not 3: a density plot sits near 1.0 and
+            # `.3g` renders both ends of [0.997, 1.003] as "1".
+            panel_state.colorbar.clim = (f"{vmin:.6g}", f"{vmax:.6g}")
             panel_state.colorbar.cmap = _mpl_to_vispy_cmap(cmap)
             _style_colorbar_tick_labels(panel_state.colorbar)
 
@@ -1129,8 +1183,13 @@ class VispyBackend(AbstractBackend):
                     pass
             elif self._jupyter_mode == "notebook":
                 self._flush_notebook_frame()
+            elif self._jupyter_mode == "image":
+                self._flush_image_frame()
             return
-        self._canvas.show()
+        if self._jupyter_mode != "image":
+            # "image" mode never has a window/widget to map -- rendering is
+            # pure offscreen `canvas.render()`, which needs no prior `show()`.
+            self._canvas.show()
         if self._jupyter_mode == "native":
             # Force the OS window to the foreground once so it reliably maps
             # on-screen before entering long synchronous simulation loops.
@@ -1149,6 +1208,8 @@ class VispyBackend(AbstractBackend):
             # Push the first frame synchronously so the widget shows content
             # immediately rather than displaying an empty placeholder.
             self._flush_notebook_frame()
+        if self._jupyter_mode == "image":
+            self._flush_image_frame()
         self._shown = True
 
     def update_figure_title(self, title: Optional[str]) -> None:
@@ -1326,6 +1387,42 @@ class VispyBackend(AbstractBackend):
                 array = backend.get_frame()
                 if array is not None:
                     backend._rfb_send_frame(array)
+        except Exception:
+            pass
+
+    def _flush_image_frame(self) -> None:
+        """Render offscreen and push the frame as a static Jupyter image.
+
+        Same ``canvas.render()`` offscreen path :meth:`export` uses -- works
+        with any GL context vispy can create (including a headless EGL/OSMesa
+        one, see ``"image"`` mode in the module docstring), no window or
+        widget required. The image is pushed through IPython's ordinary
+        display-data update (``display(..., display_id=...)`` /
+        ``DisplayHandle.update``), the same iopub message every notebook
+        frontend renders -- unlike ``"notebook"`` mode's jupyter_rfb comm,
+        nothing here depends on a live websocket/comm channel back to the
+        browser.
+        """
+        try:
+            from IPython.display import Image as _IPImage  # noqa: PLC0415
+            from IPython.display import display as ip_display  # noqa: PLC0415
+
+            array = self._canvas.render()
+            try:
+                import PIL.Image  # noqa: PLC0415
+
+                buf = _io.BytesIO()
+                PIL.Image.fromarray(array).save(buf, format="png")
+                png_bytes = buf.getvalue()
+            except ImportError:
+                from vispy.io.image import _make_png  # noqa: PLC0415
+
+                png_bytes = _make_png(array)
+            image = _IPImage(data=png_bytes, format="png")
+            if self._image_display_handle is None:
+                self._image_display_handle = ip_display(image, display_id=True)
+            else:
+                self._image_display_handle.update(image)
         except Exception:
             pass
 

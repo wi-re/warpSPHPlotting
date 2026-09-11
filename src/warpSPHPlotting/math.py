@@ -45,7 +45,15 @@ def getBounds(values: torch.Tensor, options: PlottingOptions):
             minScale = minScale if minScale > 0.0 else minElement
             norm = colors.SymLogNorm(linthresh=options.quantityLogThreshold, linscale=0.03, vmin=minScale, vmax=maxScale)
         else:
-            norm = colors.CenteredNorm(vcenter=options.midPoint, halfrange = maxScale)
+            # `halfrange` is a half-WIDTH, not an upper bound: `maxScale` here
+            # is `midPoint + max|q - midPoint|`, so the half-width is that minus
+            # the centre. Passing `maxScale` straight through was only correct
+            # for the default `midPoint == 0`; with e.g. `midPoint = 1.0` (a
+            # density plot centred on rho0) it inflated the range by the centre
+            # itself -- halfrange 1.003 instead of 0.003, ~340x too wide, which
+            # collapsed every value onto the colormap's midpoint.
+            norm = colors.CenteredNorm(vcenter=options.midPoint,
+                                       halfrange=maxScale - options.midPoint)
     else:
         if options.quantityScaling == PlotScaling.Logarithmic:
             minElement = np.min(np.abs(q)[np.abs(q)>0.0]) if np.sum(np.abs(q) > 0.0) > 0 else 1.0
@@ -78,3 +86,36 @@ def mapQuantity(
         return torch.linalg.norm(quantity, dim=-1, ord=1)
     else:
         raise ValueError(f"Unsupported mapping: {mapping}")
+
+def getSharedBounds(fluidQuantities, boundaryQuantities, options: PlottingOptions):
+    """One norm across fluid **and** boundary, so the two are comparable.
+
+    Returns ``(fluidQs, boundaryQs, norm)``; pass ``None`` (or an empty tensor)
+    for a set that is hidden, passive or absent and the norm is taken from the
+    other alone. ``(None, None, None)`` when neither is drawn.
+
+    Normalising the two sets independently and then drawing them through the
+    same colormap -- which the vispy and pyvista backends did -- makes wall
+    colours incomparable to fluid colours. A dry mDBC wall particle sitting at
+    exactly ``rho0`` is the *minimum of the boundary set*, so it saturates one
+    end of the map, while the fluid's own minimum is a different number
+    entirely; the two meet at the waterline as a hard edge that is not in the
+    data. The single colorbar can only describe one of the two norms, leaving
+    the other unlabelled. ``visualize.py`` / ``update.py`` (matplotlib) already
+    shared a norm; this is the same thing for the other backends.
+    """
+    hasFluid = fluidQuantities is not None and fluidQuantities.shape[0] > 0
+    hasBoundary = boundaryQuantities is not None and boundaryQuantities.shape[0] > 0
+
+    if hasFluid and hasBoundary:
+        combinedQs, norm = getBounds(
+            torch.cat((fluidQuantities, boundaryQuantities), dim=0), options)
+        nFluid = fluidQuantities.shape[0]
+        return combinedQs[:nFluid], combinedQs[nFluid:], norm
+    if hasFluid:
+        qs, norm = getBounds(fluidQuantities, options)
+        return qs, None, norm
+    if hasBoundary:
+        qs, norm = getBounds(boundaryQuantities, options)
+        return None, qs, norm
+    return None, None, None

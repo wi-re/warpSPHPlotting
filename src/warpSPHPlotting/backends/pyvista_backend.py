@@ -106,6 +106,25 @@ def _parse_mosaic(mosaic: str) -> Tuple[Tuple[int, int], Dict[str, Tuple[int, in
     return (nrows, ncols), label_to_pos
 
 
+def _sharedMarkerBounds(fluid, boundary, opts):
+    """`math.getSharedBounds` for the two marker sets, honouring Hide/Passive.
+
+    A set that is hidden, drawn passive (flat grey), or empty contributes
+    nothing to the norm -- it is not coloured by the quantity, so letting its
+    values set the range would stretch the map for no visible gain.
+    """
+    from ..math import getSharedBounds  # noqa: PLC0415
+
+    coloured = (VisualizeOptions.Hide, VisualizeOptions.Passive)
+    fluidQuantities = (fluid.quantities
+                       if opts.fluidVisualization not in coloured
+                       and fluid.positions.shape[0] > 0 else None)
+    boundaryQuantities = (boundary.quantities
+                          if opts.boundaryVisualization not in coloured
+                          and boundary.positions.shape[0] > 0 else None)
+    return getSharedBounds(fluidQuantities, boundaryQuantities, opts)
+
+
 def _scalar_range(q_clipped: np.ndarray, norm) -> Tuple[float, float]:
     """Extract a (vmin, vmax) pair from a matplotlib norm, with fallbacks."""
     import matplotlib.colors as mcolors  # noqa: PLC0415
@@ -340,6 +359,11 @@ class PyVistaBackend(AbstractBackend):
         # ── grid or scatter path ───────────────────────────────────────────────
         mesh_fluid, actor_fluid, fluid_range = None, None, None
         mesh_boundary, actor_boundary, boundary_range = None, None, None
+        # One norm across fluid AND boundary -- see `math.getSharedBounds`.
+        # Normalising them separately and drawing both through the same colormap
+        # makes wall colours incomparable to fluid colours, and the single
+        # scalar bar can only describe one of the two.
+        fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
         mesh_grid, actor_grid, grid_range = None, None, None
 
         if opts.gridVisualization is not None:
@@ -387,9 +411,8 @@ class PyVistaBackend(AbstractBackend):
                         name=f"fluid_{panel_key}",
                     )
                 else:
-                    q, norm = getBounds(fluid.quantities, opts)
-                    fluid_range = _scalar_range(q, norm)
-                    mesh_fluid["quantity"] = q
+                    fluid_range = _scalar_range(fluidQs, sharedNorm)
+                    mesh_fluid["quantity"] = fluidQs
                     actor_fluid = self._plotter.add_mesh(
                         mesh_fluid,
                         style="points",
@@ -418,9 +441,8 @@ class PyVistaBackend(AbstractBackend):
                         name=f"boundary_{panel_key}",
                     )
                 else:
-                    q, norm = getBounds(boundary.quantities, opts)
-                    boundary_range = _scalar_range(q, norm)
-                    mesh_boundary["quantity"] = q
+                    boundary_range = _scalar_range(boundaryQs, sharedNorm)
+                    mesh_boundary["quantity"] = boundaryQs
                     actor_boundary = self._plotter.add_mesh(
                         mesh_boundary,
                         style="points",
@@ -511,6 +533,9 @@ class PyVistaBackend(AbstractBackend):
 
         mesh_fluid = panel_state.mesh_fluid
         actor_fluid = panel_state.actor_fluid
+        # One norm across fluid AND boundary -- see `math.getSharedBounds`.
+        fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
+
         fluid_range = panel_state.fluid_scalar_range
         mesh_boundary = panel_state.mesh_boundary
         actor_boundary = panel_state.actor_boundary
@@ -595,8 +620,8 @@ class PyVistaBackend(AbstractBackend):
                             name=f"fluid_{panel_key}",
                         )
                 elif opts.fluidVisualization != VisualizeOptions.Hide:
-                    q, norm = getBounds(fluid.quantities, opts)
-                    fluid_range = _scalar_range(q, norm)
+                    q = fluidQs
+                    fluid_range = _scalar_range(fluidQs, sharedNorm)
                     if panel_state.mesh_fluid is not None and panel_state.actor_fluid is not None:
                         mesh_fluid = panel_state.mesh_fluid
                         actor_fluid = panel_state.actor_fluid
@@ -664,8 +689,8 @@ class PyVistaBackend(AbstractBackend):
                             name=f"boundary_{panel_key}",
                         )
                 elif opts.boundaryVisualization != VisualizeOptions.Hide:
-                    q, norm = getBounds(boundary.quantities, opts)
-                    boundary_range = _scalar_range(q, norm)
+                    q = boundaryQs
+                    boundary_range = _scalar_range(boundaryQs, sharedNorm)
                     if panel_state.mesh_boundary is not None and panel_state.actor_boundary is not None:
                         mesh_boundary = panel_state.mesh_boundary
                         actor_boundary = panel_state.actor_boundary
