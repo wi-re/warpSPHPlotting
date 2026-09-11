@@ -1220,7 +1220,14 @@ class VispyBackend(AbstractBackend):
         has_title = bool(text.strip())
         if self._figure_title_widget is not None:
             self._figure_title_widget.text = text
-            h = self._figure_title_height_px if has_title else 0
+            # Grow the band with the line count. `_figure_title_height_px` (36)
+            # was a fixed single-line allowance, so a multi-line title -- e.g.
+            # warpSPH's provenance banner (state / physics / run identity) --
+            # was drawn over the panel borders. 18 px per line + 18 px padding
+            # reproduces the old 36 px for a one-line title exactly.
+            nLines = text.count("\n") + 1 if has_title else 0
+            perLine = self._figure_title_height_px // 2
+            h = (perLine * nLines + perLine) if has_title else 0
             self._figure_title_widget.height_min = h
             self._figure_title_widget.height_max = h
 
