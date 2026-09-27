@@ -257,25 +257,55 @@ def _point_size(
     return max(1.0, float(options.markerSize) ** 0.5 * _MPL_PTS2_TO_VISPY_PX)
 
 
+def _estimate_particle_dx(fluid, boundary) -> float:
+    """`sqrt((masses/densities).mean())` -- the real particle spacing, from
+    whichever population is non-empty (fluid preferred; a boundary-only
+    scene, e.g. a hydrostatic wall-only frame, falls back to boundary).
+    Mirrors `warpSPHPlotting/domain.py`'s matplotlib-path `dx` computation.
+    Returns `None` if neither population has particles, so callers fall back
+    to `_auto_point_size`'s own area/count estimate."""
+    for state in (fluid, boundary):
+        n = int(state.positions.shape[0]) if state is not None else 0
+        if n > 0:
+            vol = (state.masses / state.densities).mean()
+            return float(vol.clamp_min(1e-300) ** 0.5)
+    return None
+
+
 def _auto_point_size(
     domain_,
     n_particles: int,
     panel_w_px: float,
     panel_h_px: float,
+    particle_dx: float = None,
 ) -> float:
     """Estimate a vispy pixel diameter so each particle covers roughly one cell.
 
-    Computes the inter-particle spacing from the domain area and particle count,
-    then converts to pixels using the panel size and domain extent.  Mirrors
-    the logic of ``scatter_util.computeMarkerSize`` but avoids a matplotlib
-    axes object.
+    `particle_dx` (preferred, when available): the case's own real particle
+    spacing, `sqrt((masses/densities).mean())` -- the same quantity
+    `warpSPHPlotting/domain.py`'s matplotlib path threads through to
+    `scatter_util.computeMarkerSize` as its `dx` argument. Use this whenever
+    the caller has it: `n_particles`-over-domain-area is only a valid spacing
+    estimate when particles fill the domain roughly uniformly, which is false
+    for the common case of a large multi-layer boundary/wall band around a
+    much smaller/thinner fluid volume (e.g. a dam-break tank: boundary+ghost
+    particles alone can outnumber fluid particles several-to-one while
+    covering only the perimeter, not the interior) -- dividing area by that
+    inflated `n_particles` under-counts the TRUE areal density and produces
+    markers roughly 2x too large (reported directly against a dam-break run,
+    nx=35). Falls back to the old area/count estimate only when `particle_dx`
+    is not supplied, so a caller without mass/density data still gets a
+    reasonable size instead of an error.
     """
     mn = domain_.min.cpu().numpy()
     mx = domain_.max.cpu().numpy()
     domain_w = max(float(mx[0] - mn[0]), 1e-9)
     domain_h = max(float(mx[1] - mn[1]), 1e-9)
-    if n_particles > 1:
-        # Estimated square-packing spacing
+    if particle_dx is not None and particle_dx > 0:
+        dx = float(particle_dx)
+    elif n_particles > 1:
+        # Estimated square-packing spacing -- see docstring for why this is
+        # only a fallback, not the preferred path.
         dx = (domain_w * domain_h / n_particles) ** 0.5
     else:
         dx = domain_w / 32.0
@@ -742,7 +772,8 @@ class VispyBackend(AbstractBackend):
         panel_h_px = max(1.0, ph / max(nrows, 1))
         n_total = int(fluid.positions.shape[0]) + int(boundary.positions.shape[0])
         if opts.markerSize is None:
-            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px)
+            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px,
+                                          particle_dx=_estimate_particle_dx(fluid, boundary))
         else:
             point_size = _point_size(opts, self._point_size)
 
@@ -956,7 +987,8 @@ class VispyBackend(AbstractBackend):
         panel_h_px = max(1.0, ph / max(nrows, 1))
         n_total = int(fluid.positions.shape[0]) + int(boundary.positions.shape[0])
         if opts.markerSize is None:
-            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px)
+            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px,
+                                          particle_dx=_estimate_particle_dx(fluid, boundary))
         else:
             point_size = _point_size(opts, self._point_size)
 
