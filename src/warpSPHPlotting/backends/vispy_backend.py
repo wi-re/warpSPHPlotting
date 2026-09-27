@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 from .base import AbstractBackend
+from .asyncExport import submitImageWrite
 from ..enumTypes import VisualizeOptions
 from ..options import PlottingOptions
 
@@ -1113,9 +1114,29 @@ class VispyBackend(AbstractBackend):
                 vmin, vmax = new_range
                 # 6 significant digits, not 3: a density plot sits near 1.0 and
             # `.3g` renders both ends of [0.997, 1.003] as "1".
-            panel_state.colorbar.clim = (f"{vmin:.6g}", f"{vmax:.6g}")
-            panel_state.colorbar.cmap = _mpl_to_vispy_cmap(cmap)
-            _style_colorbar_tick_labels(panel_state.colorbar)
+            # Only what changed: a new `cmap` object regenerates the colorbar's
+            # shader and texture, and a new `clim` re-lays out its tick text --
+            # the same picture either way, but at every frame of a video it
+            # was most of the colorbar's cost.
+            # (last-set values per panel on the backend: vispy widgets are
+            # frozen against new attributes)
+            cb = panel_state.colorbar
+            last = self.__dict__.setdefault("_colorbarLast", {}).setdefault(panel_key, {})
+            clim = (f"{vmin:.6g}", f"{vmax:.6g}")
+            restyle = False
+            if last.get("widget") is not cb:
+                last.clear()
+                last["widget"] = cb
+            if last.get("clim") != clim:
+                cb.clim = clim
+                last["clim"] = clim
+                restyle = True
+            if last.get("cmap") != cmap:
+                cb.cmap = _mpl_to_vispy_cmap(cmap)
+                last["cmap"] = cmap
+                restyle = True
+            if restyle:
+                _style_colorbar_tick_labels(cb)
 
         # -- update camera to fit new domain
         _fit_camera_to_domain(view, domain_)
@@ -1172,13 +1193,21 @@ class VispyBackend(AbstractBackend):
             raise RuntimeError("No canvas to export; call create_figure first.")
         img_array = self._canvas.render()
         dpi = kwargs.pop("dpi", None)
+        # `background=True`: encode + write on a worker thread (PIL releases
+        # the GIL while compressing) so a simulation's step loop does not wait
+        # on the PNG encoder; `asyncExport.waitForExports()` drains the queue
+        # (call it before reading the files, e.g. before encoding a video).
+        background = bool(kwargs.pop("background", False))
         try:
             import PIL.Image  # noqa: PLC0415
             img = PIL.Image.fromarray(img_array)
             save_kwargs = dict(kwargs)
             if dpi is not None:
                 save_kwargs.setdefault("dpi", (dpi, dpi))
-            img.save(filepath, **save_kwargs)
+            if background:
+                submitImageWrite(img, filepath, save_kwargs)
+            else:
+                img.save(filepath, **save_kwargs)
         except ImportError:
             # Pillow not available — fall back to vispy's built-in PNG writer
             from vispy.io import write_png  # noqa: PLC0415

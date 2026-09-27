@@ -2,6 +2,7 @@
 __version__ = "0.4.5"
 
 from .visualize import visualizeParticlesNew, visualize
+from .backends.asyncExport import waitForExports
 from .update import updatePlot, updateVisualization
 
 from .enumTypes import VisualizeOptions, PlotScaling, Mapping, StreamLineLocation, ColorMap, Backend
@@ -13,6 +14,7 @@ from .options import PlottingOptions, GridVisualization
 from .grid import mapToGrid, generateGrid
 
 __all__ = [
+    'waitForExports',
     "visualizeParticlesNew",
     "updatePlot",
     "VisualizeOptions",
