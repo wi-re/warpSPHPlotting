@@ -1,5 +1,5 @@
 
-__version__ = "0.4.5"
+__version__ = "0.6.0"
 
 from .visualize import visualizeParticlesNew, visualize
 from .backends.asyncExport import waitForExports
