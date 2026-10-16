@@ -7,85 +7,143 @@ import numpy as np
 from .options import PlottingOptions
 from .enumTypes import Mapping, PlotScaling
 
-def buildRotationMatrix(angles : List[float], dim: int, device: torch.device = None, dtype: torch.dtype = None):
+
+def buildRotationMatrix(
+    angles: List[float],
+    dim: int,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
+):
     if dim == 1:
         return torch.tensor([[1.0]], device=device, dtype=dtype)
     elif dim == 2:
-        return torch.tensor([[torch.cos(angles), -torch.sin(angles)],
-                             [torch.sin(angles), torch.cos(angles)]], device=device, dtype=dtype)
+        return torch.tensor(
+            [
+                [torch.cos(angles), -torch.sin(angles)],
+                [torch.sin(angles), torch.cos(angles)],
+            ],
+            device=device,
+            dtype=dtype,
+        )
     elif dim == 3:
         angle_phi = angles[0]
         angle_theta = angles[1]
-        return torch.tensor([
-            [torch.cos(angle_phi) * torch.sin(angle_theta), -torch.sin(angle_phi), torch.cos(angle_phi) * torch.cos(angle_theta)],
-            [torch.sin(angle_phi) * torch.sin(angle_theta), torch.cos(angle_phi), torch.sin(angle_phi) * torch.cos(angle_theta)],
-            [torch.cos(angle_theta), 0, -torch.sin(angle_theta)]
-        ], device=device, dtype=dtype)
+        return torch.tensor(
+            [
+                [
+                    torch.cos(angle_phi) * torch.sin(angle_theta),
+                    -torch.sin(angle_phi),
+                    torch.cos(angle_phi) * torch.cos(angle_theta),
+                ],
+                [
+                    torch.sin(angle_phi) * torch.sin(angle_theta),
+                    torch.cos(angle_phi),
+                    torch.sin(angle_phi) * torch.cos(angle_theta),
+                ],
+                [torch.cos(angle_theta), 0, -torch.sin(angle_theta)],
+            ],
+            device=device,
+            dtype=dtype,
+        )
     else:
         raise ValueError(f"Unsupported dimension: {dim}")
-    
 
 
 def getBounds(values: torch.Tensor, options: PlottingOptions):
-    q = values.detach().cpu().numpy()
-    minScale = np.min(q) if options.vMin is None else options.vMin
-    maxScale = np.max(q) if options.vMax is None else options.vMax
-    if options.quantityScaling == PlotScaling.Symmetric or options.quantityScaling == PlotScaling.SymmetricLog:
-        minScale = -np.max(np.abs(q)) if options.vMin is None else options.vMin
-        maxScale = np.max(np.abs(q)) if options.vMax is None else options.vMax
-        if options.midPoint is not None:
-            if isinstance(options.midPoint, str):
-                options.midPoint = np.median(q)
-            minScale = options.midPoint-np.max(np.abs(q - options.midPoint)) if options.vMin is None else options.vMin
-            maxScale = options.midPoint+np.max(np.abs(q - options.midPoint)) if options.vMax is None else options.vMax
-        if options.quantityScaling == PlotScaling.SymmetricLog:
-            minElement = np.min(np.abs(q)[np.abs(q)>0.0]) if np.sum(np.abs(q) > 0.0) > 0 else 1.0
-            maxElement = np.max(np.abs(q)) if np.sum(np.abs(q) > 0.0) > 0 else 10.0
-            maxScale = maxScale if maxScale > 0.0 else maxElement
-            minScale = minScale if minScale > 0.0 else minElement
-            norm = colors.SymLogNorm(linthresh=options.quantityLogThreshold, linscale=0.03, vmin=minScale, vmax=maxScale)
+    """Resolve display bounds without modifying options or physical values.
+
+    Nonfinite samples, and nonpositive samples on log scales, are masked.
+    Empty/all-invalid fields require explicit bounds so invalid data never
+    silently determines a color range.
+    """
+    raw = values.detach().cpu().numpy()
+    if np.iscomplexobj(raw):
+        raise ValueError(
+            "Complex quantities require a real-valued mapping such as magnitude."
+        )
+    q = raw.astype(float, copy=False)
+    valid = np.isfinite(q)
+    scaling = options.quantityScaling
+    if scaling == PlotScaling.Logarithmic:
+        valid &= q > 0
+    finite = q[valid]
+    if finite.size == 0 and (options.vMin is None or options.vMax is None):
+        raise ValueError("No valid quantity samples; supply finite vMin and vMax.")
+    lo = float(options.vMin) if options.vMin is not None else float(finite.min())
+    hi = float(options.vMax) if options.vMax is not None else float(finite.max())
+    if not np.isfinite([lo, hi]).all() or lo > hi:
+        raise ValueError("vMin and vMax must be finite with vMin <= vMax.")
+    if scaling in (PlotScaling.Symmetric, PlotScaling.SymmetricLog):
+        center = options.midPoint
+        if isinstance(center, str):
+            if center != "median":
+                raise ValueError("midPoint must be a number, None, or 'median'.")
+            if not finite.size:
+                raise ValueError("Cannot compute a median without valid samples.")
+            center = float(np.median(finite))
+        center = 0.0 if center is None else float(center)
+        if not np.isfinite(center):
+            raise ValueError("midPoint must be finite.")
+        if options.vMin is None or options.vMax is None:
+            radius = float(np.max(np.abs(finite - center))) if finite.size else 0.0
+            radius = max(radius, abs(center) * 1e-6, 1e-12)
+            lo = center - radius if options.vMin is None else lo
+            hi = center + radius if options.vMax is None else hi
+        if scaling == PlotScaling.Symmetric:
+            radius = max(abs(lo - center), abs(hi - center), 1e-12)
+            lo, hi = center - radius, center + radius
+            norm = colors.CenteredNorm(vcenter=center, halfrange=radius)
         else:
-            # `halfrange` is a half-WIDTH, not an upper bound: `maxScale` here
-            # is `midPoint + max|q - midPoint|`, so the half-width is that minus
-            # the centre. Passing `maxScale` straight through was only correct
-            # for the default `midPoint == 0`; with e.g. `midPoint = 1.0` (a
-            # density plot centred on rho0) it inflated the range by the centre
-            # itself -- halfrange 1.003 instead of 0.003, ~340x too wide, which
-            # collapsed every value onto the colormap's midpoint.
-            norm = colors.CenteredNorm(vcenter=options.midPoint,
-                                       halfrange=maxScale - options.midPoint)
+            if options.quantityLogThreshold <= 0:
+                raise ValueError("quantityLogThreshold must be positive.")
+            norm = colors.SymLogNorm(
+                linthresh=options.quantityLogThreshold, linscale=0.03, vmin=lo, vmax=hi
+            )
+    elif scaling == PlotScaling.Logarithmic:
+        if lo <= 0 or hi <= 0:
+            raise ValueError("Logarithmic bounds must be positive.")
+        if lo == hi:
+            lo, hi = lo / 1.01, hi * 1.01
+        norm = colors.LogNorm(vmin=lo, vmax=hi)
     else:
-        if options.quantityScaling == PlotScaling.Logarithmic:
-            minElement = np.min(np.abs(q)[np.abs(q)>0.0]) if np.sum(np.abs(q) > 0.0) > 0 else 1.0
-            maxElement = np.max(np.abs(q)) if np.sum(np.abs(q) > 0.0) > 0 else 10.0
-            maxScale = maxScale if maxScale > 0.0 else maxElement
-            minScale = minScale if minScale > 0.0 else minElement
-            norm = colors.LogNorm(vmin=minScale, vmax=maxScale)
-        else:
-            norm = colors.Normalize(vmin=minScale, vmax=maxScale)
-    
-    qs = q.clip(minScale, maxScale)
-    return qs, norm
+        if lo == hi:
+            pad = max(abs(lo) * 1e-6, 1e-12)
+            lo, hi = lo - pad, hi + pad
+        norm = colors.Normalize(vmin=lo, vmax=hi)
+    return np.ma.array(np.clip(q, lo, hi), mask=~valid), norm
 
 
 def mapQuantity(
     quantity: torch.Tensor,
     mapping: Mapping,
 ):
+    if not isinstance(quantity, torch.Tensor) or quantity.ndim == 0:
+        raise ValueError("quantity must be a tensor with one leading particle axis.")
     if mapping == Mapping.none:
-        return quantity
-    elif mapping == Mapping.x:
-        return quantity[:,0] if quantity.ndim > 1 and quantity.shape[1] > 0 else quantity.flatten()
-    elif mapping == Mapping.y:
-        return quantity[:,1]
-    elif mapping == Mapping.z:
-        return quantity[:,2]
-    elif mapping == Mapping.L2Norm or mapping == Mapping.magnitude or mapping == Mapping.L2:
-        return torch.linalg.norm(quantity, dim=-1)
-    elif mapping == Mapping.L1:
-        return torch.linalg.norm(quantity, dim=-1, ord=1)
-    else:
-        raise ValueError(f"Unsupported mapping: {mapping}")
+        return (
+            quantity.squeeze(-1)
+            if quantity.ndim == 2 and quantity.shape[1] == 1
+            else quantity
+        )
+    if mapping in (Mapping.x, Mapping.y, Mapping.z):
+        component = {Mapping.x: 0, Mapping.y: 1, Mapping.z: 2}[mapping]
+        if quantity.ndim == 1 and component == 0:
+            return quantity
+        if quantity.ndim != 2 or quantity.shape[1] <= component:
+            raise ValueError(
+                f"Mapping {mapping.value} is incompatible with shape {tuple(quantity.shape)}."
+            )
+        return quantity[:, component]
+    if mapping in (Mapping.L2Norm, Mapping.magnitude, Mapping.L2, Mapping.L1):
+        if quantity.ndim < 2:
+            return quantity.abs()
+        if not quantity.is_floating_point() and not quantity.is_complex():
+            quantity = quantity.to(torch.get_default_dtype())
+        return torch.linalg.vector_norm(
+            quantity.flatten(1), dim=1, ord=1 if mapping == Mapping.L1 else 2
+        )
+    raise ValueError(f"Unsupported mapping: {mapping}")
+
 
 def getSharedBounds(fluidQuantities, boundaryQuantities, options: PlottingOptions):
     """One norm across fluid **and** boundary, so the two are comparable.
@@ -109,7 +167,8 @@ def getSharedBounds(fluidQuantities, boundaryQuantities, options: PlottingOption
 
     if hasFluid and hasBoundary:
         combinedQs, norm = getBounds(
-            torch.cat((fluidQuantities, boundaryQuantities), dim=0), options)
+            torch.cat((fluidQuantities, boundaryQuantities), dim=0), options
+        )
         nFluid = fluidQuantities.shape[0]
         return combinedQs[:nFluid], combinedQs[nFluid:], norm
     if hasFluid:

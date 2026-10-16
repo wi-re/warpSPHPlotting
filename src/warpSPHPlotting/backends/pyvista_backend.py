@@ -1,906 +1,1042 @@
-"""PyVista rendering backend (Phase 3).
+"""PyVista rendering with physical scalar arrays and persistent scene objects.
 
-This backend represents particles as ``pv.PolyData`` point clouds, uses
-matplotlib colormaps for scalar colouring (pyvista accepts the same names),
-and supports efficient in-place scalar/position updates without rebuilding
-the full scene.
-
-Notebook display modes (pass via ``backendOptions={'jupyter_backend': ...}``):
-  ``"static"``  — default; renders off-screen and shows a PNG snapshot inline.
-  ``"trame"``   — interactive widget (requires ``trame``; install with
-                  ``pip install 'warpSPHPlotting[plot-pyvista]'``).
-  ``"none"``    — pop-out native window (good for desktop use).
-
-Update pattern
---------------
-After the initial :func:`~warpSPHPlotting.visualize.visualize` call, changes are
-pushed via ``plotState.updateQuantities(...)`` which calls
-:meth:`PyVistaBackend.update_panel` → ``mesh.points`` / ``mesh.point_data``
-mutation + ``plotter.render()``.
-
-For *static* notebook mode, call ``plotState.show()`` after each update to
-capture a new screenshot.  For *trame*, the live widget updates automatically.
-
-Current limitations (Phase 3)
-------------------------------
-- Grid-mapped visualisation (``GridVisualization``) is not yet supported.
-- Streamlines are not yet supported.
-- Log / symmetric-log scalar bar scales show clamped linear ranges.
+`backendOptions` accepts `jupyter_backend` (static/trame/none), `off_screen`,
+`window_size`, `point_size`, and `scalar_bar` styling. Tick text is positioned
+independently so nonlinear physical labels stay beside the color strip.
 """
 
-from __future__ import annotations
-
-import numpy as np
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
-
+from typing import Any
+import copy
+import threading
+import numpy as np
+import torch
 from .base import AbstractBackend
+from ._render_util import prepare_frame, view_needs_refit, view_domain
 from ..enumTypes import VisualizeOptions
-from ..options import PlottingOptions
+from .._sizing import particle_diameter, explicit_pixel_size
+from ..math import getSharedBounds
+from ._mosaic import parse_mosaic
+from ._trame_context import register_trame_window, serialized_notebook_render
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Panel state dataclass
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PyVistaVisualizationState:
-    """Per-panel rendering state kept by the PyVista backend."""
-
-    plotter: Any                   # shared pv.Plotter reference
+    plotter: Any
     row: int
     col: int
-
-    # point-cloud meshes & actor handles; None if that particle type is hidden
-    mesh_fluid: Optional[Any]
-    actor_fluid: Optional[Any]
-    mesh_boundary: Optional[Any]
-    actor_boundary: Optional[Any]
-
-    # grid (ImageData) mesh & actor; None when gridVisualization is off
-    mesh_grid: Optional[Any]
-    actor_grid: Optional[Any]
-
-    domain: Any                    # DomainDescription (detached copy)
-    options: PlottingOptions
-
-    # per-type particle states and assembled quantity (for update bookkeeping)
+    domain: Any
+    options: Any
     fluidParticles: Any
     boundaryParticles: Any
     ghostParticles: Any
     assembledQuantity: Any
-    rotatedQuantities: Any         # full per-particle quantity after ops/mapping
-
-    fluid_scalar_range: Optional[Tuple[float, float]] = None
-    boundary_scalar_range: Optional[Tuple[float, float]] = None
-    grid_scalar_range: Optional[Tuple[float, float]] = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Private helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _to_3d(positions) -> np.ndarray:
-    """Convert (N, 2-or-3) float tensor → (N, 3) float64 numpy array."""
-    pts = positions.detach().cpu().numpy().astype(np.float64)
-    if pts.ndim == 1:
-        pts = pts[:, None]
-    if pts.shape[1] == 2:
-        pts = np.column_stack([pts, np.zeros(len(pts))])
-    return pts
+    rotatedQuantities: Any
+    mesh_fluid: Any = None
+    actor_fluid: Any = None
+    mesh_boundary: Any = None
+    actor_boundary: Any = None
+    mesh_grid: Any = None
+    actor_grid: Any = None
+    actors: dict = field(default_factory=dict)
+    colorbar: Any = None
+    labels: list = field(default_factory=list)
+    normSignature: Any = None
+    lookup: Any = None
+    gridGeometry: Any = None
+    title: Any = None
+    particleDiameters: dict = field(default_factory=dict)
 
 
-def _parse_mosaic(mosaic: str) -> Tuple[Tuple[int, int], Dict[str, Tuple[int, int]]]:
-    """Parse a matplotlib mosaic string → (nrows, ncols), {label: (row, col)}.
+def _to_3d(positions):
+    pts = positions.detach().cpu().numpy()
+    return np.column_stack((pts, np.zeros(len(pts)))) if pts.shape[1] == 2 else pts
 
-    Handles simple rectangular mosaics like ``'AB'`` or ``'AB\\nCD'``.
+
+def _lookup(name):
+    """A normalized LUT keeps per-point GPU mapping constant-time.
+
+    Meshes retain raw physical quantities in a separate array. Display arrays
+    contain norm(q), and inverse tick labels describe the same transform.
     """
-    rows = [r for r in mosaic.strip().split("\n") if r.strip()]
-    nrows = len(rows)
-    ncols = max(len(r) for r in rows)
-    label_to_pos: Dict[str, Tuple[int, int]] = {}
-    for r, row in enumerate(rows):
-        for c, label in enumerate(row):
-            if label.strip() and label not in label_to_pos:
-                label_to_pos[label] = (r, c)
-    return (nrows, ncols), label_to_pos
+    import pyvista as pv
 
+    return pv.LookupTable(
+        cmap=name, scalar_range=(0.0, 1.0), nan_color=(0.5, 0.5, 0.5, 0.0)
+    )
 
-def _sharedMarkerBounds(fluid, boundary, opts):
-    """`math.getSharedBounds` for the two marker sets, honouring Hide/Passive.
-
-    A set that is hidden, drawn passive (flat grey), or empty contributes
-    nothing to the norm -- it is not coloured by the quantity, so letting its
-    values set the range would stretch the map for no visible gain.
-    """
-    from ..math import getSharedBounds  # noqa: PLC0415
-
-    coloured = (VisualizeOptions.Hide, VisualizeOptions.Passive)
-    fluidQuantities = (fluid.quantities
-                       if opts.fluidVisualization not in coloured
-                       and fluid.positions.shape[0] > 0 else None)
-    boundaryQuantities = (boundary.quantities
-                          if opts.boundaryVisualization not in coloured
-                          and boundary.positions.shape[0] > 0 else None)
-    return getSharedBounds(fluidQuantities, boundaryQuantities, opts)
-
-
-def _scalar_range(q_clipped: np.ndarray, norm) -> Tuple[float, float]:
-    """Extract a (vmin, vmax) pair from a matplotlib norm, with fallbacks."""
-    import matplotlib.colors as mcolors  # noqa: PLC0415
-
-    try:
-        if isinstance(norm, mcolors.CenteredNorm) and norm.halfrange is not None:
-            return (
-                float(norm.vcenter - norm.halfrange),
-                float(norm.vcenter + norm.halfrange),
-            )
-        vmin = norm.vmin
-        vmax = norm.vmax
-        if vmin is not None and vmax is not None:
-            return float(vmin), float(vmax)
-    except AttributeError:
-        pass
-
-    return float(np.nanmin(q_clipped)), float(np.nanmax(q_clipped))
-
-
-def _apply_norm(q_clipped: np.ndarray, norm) -> np.ndarray:
-    """Apply a matplotlib norm to produce values in [0, 1] for PyVista.
-
-    Storing norm(q) in the PyVista mesh and using ``clim=(0, 1)`` ensures
-    all norm types (Normalize, CenteredNorm, LogNorm, SymLogNorm) render
-    with the correct colormap distribution regardless of data offset/scale.
-    Without this, CenteredNorm with ``vcenter != 0`` causes the colormap to
-    be shifted because PyVista applies a plain linear mapping between
-    ``clim`` and the colormap range.
-    """
-    result = norm(q_clipped)
-    if hasattr(result, 'data'):  # masked array returned by some norms
-        result = result.data
-    return np.clip(result.astype(np.float64), 0.0, 1.0)
-
-
-def _grid_to_image_data(gridState, gridQuantity, nxs, gridExtent, options) -> Any:
-    """Convert mapToGrid output to a ``pv.ImageData`` with scalar point data."""
-    import pyvista as pv  # noqa: PLC0415
-    import numpy as np  # noqa: PLC0415
-    from ..math import getBounds  # noqa: PLC0415
-
-    qs, norm = getBounds(gridQuantity, options)
-    scalar_range = _scalar_range(qs, norm)
-
-    # Infer origin and spacing from the grid positions.
-    # generateGrid places points at cell centres; we recover spacing from the
-    # difference between adjacent points along each axis.
-    nx, ny = nxs[0], nxs[1]
-    pts = gridState.positions.detach().cpu()
-    dx = float(pts[ny, 0] - pts[0, 0]) if nx > 1 else float(gridExtent['max'][0] - gridExtent['min'][0])
-    dy = float(pts[1, 1]  - pts[0, 1]) if ny > 1 else float(gridExtent['max'][1] - gridExtent['min'][1])
-    ox = float(pts[0, 0])
-    oy = float(pts[0, 1])
-
-    image = pv.ImageData()
-    image.dimensions = (nx, ny, 1)
-    image.spacing   = (dx, dy, 1.0)
-    image.origin    = (ox, oy, 0.0)
-    # PyVista/VTK ImageData uses X-fastest (Fortran-like) flat order:
-    #   flat index k = ix + nx * iy
-    # But generateGrid uses indexing='ij' (C-order): k = ny * ix + iy
-    # Transpose from (nx, ny) → (ny, nx) before C-flatten so X varies fastest.
-    image.point_data["quantity"] = qs.reshape(nx, ny).T.reshape(-1).astype(np.float64)
-
-    return image, scalar_range
-
-
-def _make_domain_wireframe(domain_) -> Any:
-    """Return a pyvista line mesh tracing the domain bounding box."""
-    import pyvista as pv  # noqa: PLC0415
-    import numpy as np  # noqa: PLC0415
-
-    mn = domain_.min.cpu().numpy()
-    mx = domain_.max.cpu().numpy()
-    dim = domain_.dim
-
-    if dim == 2:
-        # Explicit line segments forming the 2D domain rectangle.
-        # pv.PolyData lines format: for each segment [2, i0, i1].
-        pts = np.array([
-            [mn[0], mn[1], 0.0],
-            [mx[0], mn[1], 0.0],
-            [mx[0], mx[1], 0.0],
-            [mn[0], mx[1], 0.0],
-        ], dtype=float)
-        lines = np.array([2, 0, 1, 2, 1, 2, 2, 2, 3, 2, 3, 0], dtype=int)
-        mesh = pv.PolyData()
-        mesh.points = pts
-        mesh.lines = lines
-        return mesh
-    else:
-        bounds = [mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]]
-        return pv.Box(bounds=bounds).extract_feature_edges()
-
-
-def _cmap_name(options: PlottingOptions) -> str:
-    return options.colorMap.value + ("_r" if options.flipColorMap else "")
-
-
-def _point_size(options: PlottingOptions, default_size: float) -> float:
-    """Resolve per-panel point size with backend default fallback."""
-    if options.markerSize is None:
-        return float(default_size)
-    return float(options.markerSize)
-
-
-def _in_ipykernel() -> bool:
-    """Best-effort detection for notebook kernels (Jupyter/VS Code)."""
-    try:
-        from IPython import get_ipython  # noqa: PLC0415
-
-        ip = get_ipython()
-        return ip is not None and "IPKernelApp" in getattr(ip, "config", {})
-    except Exception:
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Backend implementation
-# ─────────────────────────────────────────────────────────────────────────────
 
 class PyVistaBackend(AbstractBackend):
-    """PyVista / VTK-backed rendering backend (Phase 3)."""
-
-    def __init__(self) -> None:
-        self._plotter: Any = None
-        self._axes: Dict[str, Tuple[int, int]] = {}
-        self._jupyter_backend: str = "static"
-        self._point_size: float = 8.0
-        self._shown: bool = False
-        self._display_handle: Any = None  # IPython display handle for in-place updates
-        self._trame_view: Any = None      # keep viewer alive across incremental updates
-
-    # -------------------------------------------------------------------------
-    # Figure management
-    # -------------------------------------------------------------------------
-
-    def create_figure(
-        self,
-        mosaic: str,
-        figsize: Tuple[float, float],
-        sharex: bool,
-        sharey: bool,
-        figTitle: Optional[str],
-        backendOptions: Optional[dict],
-    ) -> Any:
-        import pyvista as pv  # noqa: PLC0415
-
-        opts = backendOptions or {}
-        requested_backend = opts.get("jupyter_backend", "static")
-        notebook_fallback = opts.get("notebook_fallback_backend", "trame")
-        # Native pop-out windows from notebook kernels are often unreliable
-        # (especially in VS Code). Fall back to a notebook-safe backend.
-        if requested_backend == "none" and _in_ipykernel():
-            self._jupyter_backend = notebook_fallback
-        else:
-            self._jupyter_backend = requested_backend
-        self._point_size = float(opts.get("point_size", 8.0))
+    def __init__(self):
+        self._render_lock = threading.RLock()
+        self._trame_context_guard = None
+        self._plotter = None
+        self._axes = {}
         self._shown = False
-        self._display_handle = None  # reset so new figure gets its own output cell anchor
-        self._trame_view = None
-        # Note: do NOT call pv.set_jupyter_backend() here — it’s a global
-        # setting and interferes with other plotters.  We pass jupyter_backend
-        # directly to plotter.show() instead.
+        self._display_handle = None
+        self._states = {}
+        self._title_renderer = None
+        self._title_actor = None
+        self._title_lines = -1
+        self._title_layout = None
+        self._title_text = ""
+        self._streamline_multisamples = None
 
-        shape, label_to_pos = _parse_mosaic(mosaic)
-        self._axes = label_to_pos
+    def create_figure(self, mosaic, figsize, sharex, sharey, figTitle, backendOptions):
+        import pyvista as pv
 
-        # Offscreen rendering is required for static image capture;
-        # interactive modes need on-screen (off_screen=False).
-        off_screen = self._jupyter_backend == "static"
-
+        if bool(sharex) != bool(sharey):
+            raise ValueError(
+                "PyVista links full cameras; set sharex and sharey both True or both False."
+            )
+        opts = backendOptions or {}
+        allowed = {
+            "jupyter_backend",
+            "off_screen",
+            "window_size",
+            "point_size",
+            "scalar_bar",
+            "notebook_fallback_backend",
+            "jupyter_kwargs",
+        }
+        unknown = opts.keys() - allowed
+        if unknown:
+            raise TypeError(f"Unknown PyVista backend options: {sorted(unknown)}")
+        self._opts = opts
+        self._jupyter_backend = opts.get("jupyter_backend", "static")
+        if self._jupyter_backend not in ("static", "trame", "none"):
+            raise ValueError("jupyter_backend must be static, trame, or none.")
+        if (
+            self._jupyter_backend == "trame"
+            and opts.get("jupyter_kwargs", {}).get("mode", "server") != "server"
+        ):
+            raise ValueError(
+                "PyVista notebook plots require server rendering to preserve "
+                "physical colorbar labels and axes. Set jupyter_kwargs mode='server'."
+            )
+        shape, axes, spans = parse_mosaic(mosaic)
+        # vtk renderer viewports allow rectangular spans without duplicate panels.
+        self._axes = axes
+        self._spans, self._shape = spans, shape
         self._plotter = pv.Plotter(
             shape=shape,
-            window_size=[int(figsize[0] * 96), int(figsize[1] * 96)],
-            off_screen=off_screen,
+            off_screen=opts.get("off_screen", self._jupyter_backend == "static"),
+            window_size=opts.get(
+                "window_size", (int(figsize[0] * 96), int(figsize[1] * 96))
+            ),
             title=figTitle or "warpSPHPlotting",
+        )
+        if self._plotter.off_screen:
+            # Static/offscreen captures need one readable front buffer. A
+            # double-buffered GLX context can wait for display synchronization
+            # on every capture (one second on the tested NVIDIA host).
+            # Single buffering avoids that wait while retaining valid pixels;
+            # disabling SwapBuffers alone instead leaves screenshots black.
+            self._plotter.render_window.DoubleBufferOff()
+        for key, (r, c) in axes.items():
+            self._plotter.subplot(r, c)
+            r0, c0, r1, c1 = spans[key]
+            self._plotter.renderer.SetViewport(
+                c0 / shape[1],
+                1 - (r1 + 1) / shape[0],
+                (c1 + 1) / shape[1],
+                1 - r0 / shape[0],
+            )
+        occupied = set(axes.values())
+        covered = {
+            (r, c)
+            for r0, c0, r1, c1 in spans.values()
+            for r in range(r0, r1 + 1)
+            for c in range(c0, c1 + 1)
+        }
+        for r in range(shape[0]):
+            for c in range(shape[1]):
+                if (r, c) in covered and (r, c) not in occupied:
+                    self._plotter.subplot(r, c)
+                    self._plotter.renderer.SetDraw(False)
+        self._plotter.set_background("white", all_renderers=True)
+        # VTK has one camera object for x/y/z; link only when both axes are shared.
+        self._share_camera = bool(sharex and sharey)
+        self._camera_groups = None
+        self._interaction_dimension = None
+        self.update_figure_title(figTitle)
+        self._layout_observer = self._plotter.render_window.AddObserver(
+            "StartEvent", self._refresh_layout
         )
         return self._plotter
 
-    def get_axes(self) -> Dict[str, Tuple[int, int]]:
+    def get_axes(self):
         return self._axes
 
-    # -------------------------------------------------------------------------
-    # Per-panel rendering
-    # -------------------------------------------------------------------------
-
+    @serialized_notebook_render
     def render_panel(
-        self,
-        panel_key: str,
-        particleState: Any,
-        domain: Any,
-        quantity: Any,
-        options: PlottingOptions,
-    ) -> PyVistaVisualizationState:
-        import pyvista as pv  # noqa: PLC0415
-
-        from ._render_util import prepare_particle_states  # noqa: PLC0415
-        from ..math import getBounds  # noqa: PLC0415
-
-        row, col = self._axes[panel_key]
-        self._plotter.subplot(row, col)
-
-        # ── preprocessing ────────────────────────────────────────────────────
-        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = prepare_particle_states(
-            particleState, domain, quantity, options
+        self, key, particleState, domain, quantity, options, _preparedFrame=None
+    ):
+        f = _preparedFrame or prepare_frame(particleState, domain, quantity, options)
+        r, c = self._axes[key]
+        s = PyVistaVisualizationState(
+            self._plotter,
+            r,
+            c,
+            f.domain,
+            f.options,
+            f.fluid,
+            f.boundary,
+            f.ghost,
+            f.assembled,
+            f.particles.quantities,
         )
+        self._states[key] = s
+        return self._render(key, s, f, initial=True)
 
-        # ── camera & title ────────────────────────────────────────────────────
-        # NOTE: view_xy() is deferred to after all meshes are added so that
-        # reset_camera() (called internally) has actual scene bounds to fit.
-        if opts.plotTitle is not None:
-            self._plotter.add_text(
-                opts.plotTitle,
-                position='upper_edge',
-                font_size=9,
-                color='black',
-                name=f'title_{panel_key}',
-            )
-
-        # ── domain bounding box ───────────────────────────────────────────────
-        if opts.plotDomain:
-            self._plotter.add_mesh(
-                _make_domain_wireframe(domain_),
-                style="wireframe",
-                color="blue",
-                line_width=1,
-                name=f"domain_{panel_key}",
-            )
-
-        # ── grid or scatter path ───────────────────────────────────────────────
-        mesh_fluid, actor_fluid, fluid_range = None, None, None
-        mesh_boundary, actor_boundary, boundary_range = None, None, None
-        # One norm across fluid AND boundary -- see `math.getSharedBounds`.
-        # Normalising them separately and drawing both through the same colormap
-        # makes wall colours incomparable to fluid colours, and the single
-        # scalar bar can only describe one of the two.
-        fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
-        mesh_grid, actor_grid, grid_range = None, None, None
-
-        if opts.gridVisualization is not None:
-            # ── grid (ImageData) ──────────────────────────────────────────────
-            from ..grid import mapToGrid  # noqa: PLC0415
-
-            gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-                particleState=particleState,
-                quantity=rotated_q,
-                domain=domain_,
-                nx=opts.gridVisualization.resolution,
-                targetNeighbors=50,
-                kernel=opts.plottingKernel,
-                alignment="center",
-                includeFluid=opts.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary=opts.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode=opts.gridVisualization.gridSupport,
-            )
-
-            mesh_grid, grid_range = _grid_to_image_data(gridState, gridQuantity, nxs, gridExtent, opts)
-            actor_grid = self._plotter.add_mesh(
-                mesh_grid,
-                scalars="quantity",
-                cmap=_cmap_name(opts),
-                clim=grid_range,
-                show_scalar_bar=opts.showColorBar,
-                scalar_bar_args={"title": panel_key},
-                name=f"grid_{panel_key}",
-            )
-
-        else:
-            point_size = _point_size(opts, self._point_size)
-            # ── fluid point cloud ─────────────────────────────────────────────
-            if opts.fluidVisualization != VisualizeOptions.Hide and fluid.positions.shape[0] > 0:
-                pts = _to_3d(fluid.positions)
-                mesh_fluid = pv.PolyData(pts)
-
-                if opts.fluidVisualization == VisualizeOptions.Passive:
-                    actor_fluid = self._plotter.add_mesh(
-                        mesh_fluid,
-                        style="points",
-                        point_size=point_size,
-                        color="gray",
-                        opacity=0.5,
-                        name=f"fluid_{panel_key}",
-                    )
-                else:
-                    fluid_range = _scalar_range(fluidQs, sharedNorm)
-                    mesh_fluid["quantity"] = fluidQs
-                    actor_fluid = self._plotter.add_mesh(
-                        mesh_fluid,
-                        style="points",
-                        point_size=point_size,
-                        render_points_as_spheres=False,
-                        scalars="quantity",
-                        cmap=_cmap_name(opts),
-                        clim=fluid_range,
-                        show_scalar_bar=opts.showColorBar,
-                        scalar_bar_args={"title": panel_key},
-                        name=f"fluid_{panel_key}",
-                    )
-
-            # ── boundary point cloud ──────────────────────────────────────────
-            if opts.boundaryVisualization != VisualizeOptions.Hide and boundary.positions.shape[0] > 0:
-                pts = _to_3d(boundary.positions)
-                mesh_boundary = pv.PolyData(pts)
-
-                if opts.boundaryVisualization == VisualizeOptions.Passive:
-                    actor_boundary = self._plotter.add_mesh(
-                        mesh_boundary,
-                        style="points",
-                        point_size=point_size,
-                        color="gray",
-                        opacity=0.5,
-                        name=f"boundary_{panel_key}",
-                    )
-                else:
-                    boundary_range = _scalar_range(boundaryQs, sharedNorm)
-                    mesh_boundary["quantity"] = boundaryQs
-                    actor_boundary = self._plotter.add_mesh(
-                        mesh_boundary,
-                        style="points",
-                        point_size=point_size,
-                        render_points_as_spheres=False,
-                        scalars="quantity",
-                        cmap=_cmap_name(opts),
-                        clim=boundary_range,
-                        show_scalar_bar=False,   # avoid duplicate scalar bars
-                        name=f"boundary_{panel_key}",
-                    )
-
-        # ── axis bounds / labels ──────────────────────────────────────────────
-        self._plotter.show_bounds(
-            show_zaxis=(domain_.dim > 2),
-            show_zlabels=(domain_.dim > 2),
-            xlabel='X',
-            ylabel='Y',
-            font_size=8,
-            location='outer',
-            ticks='both',
-            grid=False,
-        )
-
-        # ── camera fit ────────────────────────────────────────────────────────
-        # Called after all actors are in the scene so reset_camera() has
-        # valid bounds to zoom to.
-        if domain_.dim == 2:
-            self._plotter.view_xy()
-        self._plotter.reset_camera()
-
-        return PyVistaVisualizationState(
-            plotter=self._plotter,
-            row=row,
-            col=col,
-            mesh_fluid=mesh_fluid,
-            actor_fluid=actor_fluid,
-            mesh_boundary=mesh_boundary,
-            actor_boundary=actor_boundary,
-            mesh_grid=mesh_grid,
-            actor_grid=actor_grid,
-            domain=domain_,
-            options=opts,
-            fluidParticles=fluid,
-            boundaryParticles=boundary,
-            ghostParticles=ghost,
-            assembledQuantity=assembled,
-            rotatedQuantities=rotated_q,
-            fluid_scalar_range=fluid_range,
-            boundary_scalar_range=boundary_range,
-            grid_scalar_range=grid_range,
-        )
-
+    @serialized_notebook_render
     def update_panel(
-        self,
-        panel_key: str,
-        panel_state: PyVistaVisualizationState,
-        particleState: Any,
-        domain: Any,
-        quantity: Any,
-        options: PlottingOptions,
-        **kwargs: Any,
-    ) -> PyVistaVisualizationState:
-        import copy as _copy  # noqa: PLC0415
-        from ._render_util import prepare_particle_states  # noqa: PLC0415
-        from ..math import getBounds  # noqa: PLC0415
-        import pyvista as pv  # noqa: PLC0415
-
-        # Apply any option overrides supplied via newOptions kwargs so that
-        # colormap changes etc. are reflected in this update.
-        if kwargs:
-            options = _copy.deepcopy(options)
-            for k, v in kwargs.items():
-                if hasattr(options, k):
-                    setattr(options, k, v)
-
-        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = prepare_particle_states(
-            particleState, domain, quantity, options
+        self, key, panel_state, particleState, domain, quantity, options, **kwargs
+    ):
+        f = kwargs.pop("_preparedFrame", None)
+        opts = copy.deepcopy(options)
+        for k, v in kwargs.items():
+            if not hasattr(opts, k):
+                raise TypeError(f"Unknown plotting option: {k}")
+            setattr(opts, k, v)
+        return self._render(
+            key, panel_state, f or prepare_frame(particleState, domain, quantity, opts)
         )
 
-        colormap_changed = (
-            panel_state.options.colorMap != opts.colorMap
-            or panel_state.options.flipColorMap != opts.flipColorMap
-            or panel_state.options.showColorBar != opts.showColorBar
+    def _remove(self, s, name):
+        actor = s.actors.pop(name, None)
+        if actor is not None:
+            self._plotter.remove_actor(actor, reset_camera=False, render=False)
+
+    def _group_cameras(self, key, s, f):
+        # A volume and a planar slice need different camera orientations.
+        # Rebuild links only when panel coordinate systems change, preserving
+        # each camera before detaching it from a formerly compatible group.
+        import pyvista as pv
+
+        s.cameraGroup = (f.domain.dim, tuple(f.displayAxes or range(f.domain.dim)))
+        signature = tuple((k, state.cameraGroup) for k, state in self._states.items())
+        if not self._share_camera or signature == self._camera_groups:
+            return
+        self._camera_groups = signature
+        groups = {}
+        for panel_key, state in self._states.items():
+            renderer = self._plotter.renderers[state.row * self._shape[1] + state.col]
+            camera = pv.Camera()
+            camera.DeepCopy(renderer.GetActiveCamera())
+            renderer.camera = camera
+            group = groups.setdefault(state.cameraGroup, [])
+            group.append(state.row * self._shape[1] + state.col)
+        for indices in groups.values():
+            if len(indices) > 1:
+                self._plotter.link_views(indices)
+
+    def _mesh(self, s, name, mesh, passive, opts, lookup):
+        previous = s.actors.get(name)
+        if previous is not None:
+            # Reuse actors; replace input data when topology changes.
+            previous.mapper.dataset = mesh
+            actor = previous
+        else:
+            kw = dict(
+                name=name,
+                show_scalar_bar=False,
+                reset_camera=False,
+                render=False,
+                lighting=False,
+                point_size=self._point_size(opts),
+                style="points" if "grid" not in name else "surface",
+            )
+            actor = self._plotter.add_mesh(
+                mesh,
+                color="gray" if passive else None,
+                scalars=None if passive else "display_quantity",
+                **kw,
+            )
+            s.actors[name] = actor
+        actor.prop.point_size = self._point_size(opts)
+        actor.prop.lighting = False
+        actor.prop.render_points_as_spheres = s.cameraGroup[0] == 3
+        actor.prop.opacity = 0.5 if passive else 1.0
+        # A transparent NaN LUT entry makes VTK classify even fully valid
+        # point clouds as translucent. Its OIT pass blends front/back particle
+        # colors instead of occluding them. Active scatter has only finite
+        # vertices (filtered below), so it belongs in the opaque depth pass.
+        actor.SetForceOpaque(not passive and "grid" not in name)
+        actor.mapper.scalar_visibility = not passive
+        if passive:
+            actor.prop.color = "gray"
+        else:
+            actor.mapper.array_name = "display_quantity"
+            actor.mapper.SetLookupTable(lookup)
+            actor.mapper.scalar_range = lookup.GetRange()
+        return actor
+
+    def _point_size(self, opts):
+        if opts.markerSize is not None:
+            return explicit_pixel_size(opts.markerSize)
+        return float(self._opts.get("point_size", 1.0))
+
+    def _volume(self, key, s, mesh, opts, cmap, domain):
+        """Ray-cast the interior, reserving scalar zero for uncovered samples.
+
+        Physical quantities and normalized display values stay on the mesh.
+        The additional byte array is only a volume transfer-function input;
+        covered physical zeros map to a nontransparent entry, just like all
+        other valid samples. Opacity distance uses world units so changing the
+        interpolation resolution does not also change the apparent density.
+        """
+        import pyvista as pv
+        from matplotlib import colormaps
+
+        values = np.asarray(mesh.point_data["display_quantity"])
+        valid = np.isfinite(values)
+        encoded = np.zeros(values.shape, dtype=np.uint8)
+        encoded[valid] = 1 + np.rint(np.clip(values[valid], 0, 1) * 254).astype(
+            np.uint8
         )
-
-        self._plotter.subplot(panel_state.row, panel_state.col)
-
-        mesh_fluid = panel_state.mesh_fluid
-        actor_fluid = panel_state.actor_fluid
-        # One norm across fluid AND boundary -- see `math.getSharedBounds`.
-        fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
-
-        fluid_range = panel_state.fluid_scalar_range
-        mesh_boundary = panel_state.mesh_boundary
-        actor_boundary = panel_state.actor_boundary
-        boundary_range = panel_state.boundary_scalar_range
-        mesh_grid = panel_state.mesh_grid
-        actor_grid = panel_state.actor_grid
-        grid_range = panel_state.grid_scalar_range
-
-        if opts.gridVisualization is not None:
-            # ── grid update: replace actor via same name ──────────────────────
-            from ..grid import mapToGrid  # noqa: PLC0415
-
-            gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-                particleState=particleState,
-                quantity=rotated_q,
-                domain=domain_,
-                nx=opts.gridVisualization.resolution,
-                targetNeighbors=50,
-                kernel=opts.plottingKernel,
-                alignment="center",
-                includeFluid=opts.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary=opts.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode=opts.gridVisualization.gridSupport,
+        mesh.point_data["volume_quantity"] = encoded
+        mesh.set_active_scalars("volume_quantity")
+        signature = (cmap, opts.gridVisualization.volumeOpacity)
+        if getattr(s, "volumeSignature", None) != signature:
+            colors = np.zeros((256, 4), dtype=np.uint8)
+            colors[1:] = colormaps[cmap](np.linspace(0, 1, 255), bytes=True)
+            colors[1:, 3] = round(255 * opts.gridVisualization.volumeOpacity)
+            s.volumeLookup = pv.LookupTable(values=colors, scalar_range=(0, 255))
+            s.volumeSignature = signature
+        distance = float(torch.linalg.vector_norm(domain.max - domain.min)) * 0.1
+        name = f"grid_{key}"
+        actor = s.actors.get(name)
+        if actor is None:
+            actor = self._plotter.add_volume(
+                mesh,
+                scalars="volume_quantity",
+                cmap=s.volumeLookup,
+                clim=(0, 255),
+                opacity_unit_distance=distance,
+                shade=False,
+                show_scalar_bar=False,
+                reset_camera=False,
+                render=False,
+                name=name,
             )
+            s.actors[name] = actor
+        else:
+            actor.mapper.dataset = mesh
+            actor.mapper.lookup_table = s.volumeLookup
+            actor.prop.apply_lookup_table(s.volumeLookup)
+            actor.prop.opacity_unit_distance = distance
+        actor.prop.interpolation_type = "linear"
+        return actor
 
-            mesh_grid, grid_range = _grid_to_image_data(
-                gridState, gridQuantity, nxs, gridExtent, opts
+    def _resize_particles(self, key, s):
+        if s.options.markerSize is not None or "point_size" in self._opts:
+            return
+        renderer = self._plotter.renderer
+        # Project at the focal plane. This is exact for the 2D parallel camera
+        # and a representative depth for native 3D point clouds.
+        camera = renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint())
+        direction = np.asarray(camera.GetDirectionOfProjection())
+        right = np.cross(direction, camera.GetViewUp())
+        right /= np.linalg.norm(right)
+        renderer.SetWorldPoint(*focal, 1)
+        renderer.WorldToDisplay()
+        origin = np.asarray(renderer.GetDisplayPoint())
+        renderer.SetWorldPoint(*(focal + right), 1)
+        renderer.WorldToDisplay()
+        pixels_per_unit = np.linalg.norm(
+            np.asarray(renderer.GetDisplayPoint()) - origin
+        )
+        for kind, diameter in s.particleDiameters.items():
+            actor = s.actors.get(f"{kind}_{key}")
+            if actor is not None:
+                actor.prop.point_size = max(0.1, diameter * pixels_per_unit)
+
+    def _render(self, key, s, f, initial=False):
+        import pyvista as pv
+        from ..grid import mapFrameToGrid, gridDisplayBounds
+
+        self._plotter.subplot(s.row, s.col)
+        opts = f.options
+        dimension_changed = initial or s.domain.dim != f.domain.dim
+        self._group_cameras(key, s, f)
+        changed = initial or view_needs_refit(
+            s.domain, f, getattr(s, "displayAxes", None)
+        )
+        cmap = opts.colorMap.value + ("_r" if opts.flipColorMap else "")
+        fq, bq, norm = f.sharedBounds or getSharedBounds(
+            (
+                f.fluid.quantities
+                if opts.fluidVisualization == VisualizeOptions.Visualize
+                else None
+            ),
+            (
+                f.boundary.quantities
+                if opts.boundaryVisualization == VisualizeOptions.Visualize
+                else None
+            ),
+            opts,
+        )
+        if opts.gridVisualization:
+            gs, gq, n, ext = mapFrameToGrid(f, f.particles.quantities)
+            qs, norm = gridDisplayBounds(gq, ext, opts)
+        signature = (
+            None
+            if norm is None
+            else (
+                cmap,
+                type(norm).__name__,
+                float(norm.vmin),
+                float(norm.vmax),
+                opts.quantityLogThreshold,
             )
-            if panel_state.mesh_grid is not None and panel_state.actor_grid is not None:
-                # Fast path: keep actor alive and only update scalar field.
-                panel_state.mesh_grid.point_data["quantity"] = mesh_grid.point_data["quantity"]
-                mesh_grid = panel_state.mesh_grid
-                actor_grid = panel_state.actor_grid
-                try:
-                    actor_grid.mapper.scalar_range = grid_range
-                except Exception:
-                    pass
-                if colormap_changed:
-                    actor_grid = self._plotter.add_mesh(
-                        mesh_grid,
-                        scalars="quantity",
-                        cmap=_cmap_name(opts),
-                        clim=grid_range,
-                        show_scalar_bar=opts.showColorBar,
-                        scalar_bar_args={"title": panel_key},
-                        name=f"grid_{panel_key}",
+        )
+        if (norm is not None or opts.gridVisualization is not None) and (
+            s.lookup is None or getattr(s, "_lookupCmap", None) != cmap
+        ):
+            s.lookup = _lookup(cmap)
+            s._lookupCmap = cmap
+        s.normSignature = signature
+        s.norm = norm
+        if opts.gridVisualization:
+            self._remove(s, f"fluid_{key}")
+            self._remove(s, f"boundary_{key}")
+            s.mesh_fluid = s.actor_fluid = s.mesh_boundary = s.actor_boundary = None
+            dims = tuple(n) + ((1,) if len(n) == 2 else ())
+            pts = gs.positions.detach().cpu().numpy()
+            spacing = tuple(
+                float((ext["max"][i] - ext["min"][i]) / n[i]) for i in range(len(n))
+            ) + ((1.0,) if len(n) == 2 else ())
+            origin = tuple(pts[0]) + ((0.0,) if len(n) == 2 else ())
+            geom = (dims, spacing, origin)
+            mesh = (
+                s.mesh_grid
+                if s.mesh_grid is not None and geom == s.gridGeometry
+                else pv.ImageData(dimensions=dims, spacing=spacing, origin=origin)
+            )
+            mesh.point_data["quantity"] = (
+                gq.detach().cpu().numpy().reshape(n).ravel(order="F")
+            )
+            mesh.point_data["display_quantity"] = (
+                np.ma.filled(norm(qs) if norm is not None else qs, np.nan)
+                .reshape(n)
+                .ravel(order="F")
+            )
+            s.mesh_grid = mesh
+            s.gridGeometry = geom
+            mode = opts.gridVisualization.renderMode if f.domain.dim == 3 else "surface"
+            if mode != getattr(s, "gridMode", None):
+                self._remove(s, f"grid_{key}")
+            s.gridMode = mode
+            s.actor_grid = (
+                self._volume(key, s, mesh, opts, cmap, f.domain)
+                if mode == "volume"
+                else self._mesh(s, f"grid_{key}", mesh, False, opts, s.lookup)
+            )
+        else:
+            self._remove(s, f"grid_{key}")
+            s.mesh_grid = s.actor_grid = None
+            for kind, pop, variant, values in [
+                ("fluid", f.fluid, opts.fluidVisualization, fq),
+                ("boundary", f.boundary, opts.boundaryVisualization, bq),
+            ]:
+                name = f"{kind}_{key}"
+                mesh = getattr(s, f"mesh_{kind}")
+                if variant == VisualizeOptions.Hide or not len(pop.positions):
+                    self._remove(s, name)
+                    mesh = actor = None
+                else:
+                    pts = _to_3d(pop.positions)
+                    if mesh is None or mesh.n_points != len(pts):
+                        mesh = pv.PolyData(pts)
+                    else:
+                        mesh.points = pts
+                    mesh.point_data["quantity"] = pop.quantities.detach().cpu().numpy()
+                    if values is not None:
+                        mesh.point_data["display_quantity"] = np.ma.filled(
+                            norm(values), np.nan
+                        )
+                    passive = variant == VisualizeOptions.Passive
+                    valid = (
+                        np.ones(len(pts), dtype=bool)
+                        if passive
+                        else np.isfinite(mesh.point_data["display_quantity"])
                     )
-            else:
-                # Slow path: initial create or after mode switch.
-                actor_grid = self._plotter.add_mesh(
-                    mesh_grid,
-                    scalars="quantity",
-                    cmap=_cmap_name(opts),
-                    clim=grid_range,
-                    show_scalar_bar=opts.showColorBar,
-                    scalar_bar_args={"title": panel_key},
-                    name=f"grid_{panel_key}",
+                    if not valid.all() or mesh.n_verts != len(pts):
+                        ids = np.flatnonzero(valid)
+                        mesh.verts = np.column_stack(
+                            (np.ones(len(ids), dtype=int), ids)
+                        ).ravel()
+                    actor = self._mesh(
+                        s,
+                        name,
+                        mesh,
+                        variant == VisualizeOptions.Passive,
+                        opts,
+                        s.lookup,
+                    )
+                setattr(s, f"mesh_{kind}", mesh)
+                setattr(s, f"actor_{kind}", actor)
+        if opts.plotDomain:
+            mn = f.domain.min.cpu().numpy()
+            mx = f.domain.max.cpu().numpy()
+            if f.domain.dim == 2:
+                z = float((mx - mn).max()) * 1e-4
+                pts = np.array(
+                    [
+                        [mn[0], mn[1], z],
+                        [mx[0], mn[1], z],
+                        [mx[0], mx[1], z],
+                        [mn[0], mx[1], z],
+                        [mn[0], mn[1], z],
+                    ]
                 )
-
+                box = pv.lines_from_points(pts)
+            else:
+                box = pv.Box(
+                    bounds=np.column_stack((mn, mx)).ravel()
+                ).extract_feature_edges()
+            if changed or f"domain_{key}" not in s.actors:
+                self._remove(s, f"domain_{key}")
+                s.actors[f"domain_{key}"] = self._plotter.add_mesh(
+                    box,
+                    color="blue",
+                    line_width=1,
+                    name=f"domain_{key}",
+                    reset_camera=False,
+                    render=False,
+                    lighting=False,
+                )
         else:
-            point_size = _point_size(opts, self._point_size)
-            # ── scatter update: mutate existing meshes when possible ──────────
-            if fluid.positions.shape[0] > 0:
-                pts = _to_3d(fluid.positions)
-                if opts.fluidVisualization == VisualizeOptions.Passive:
-                    if panel_state.mesh_fluid is not None and panel_state.actor_fluid is not None:
-                        mesh_fluid = panel_state.mesh_fluid
-                        actor_fluid = panel_state.actor_fluid
-                        mesh_fluid.points = pts
-                        try:
-                            actor_fluid.prop.point_size = point_size
-                        except Exception:
-                            pass
-                    else:
-                        mesh_fluid = pv.PolyData(pts)
-                        actor_fluid = self._plotter.add_mesh(
-                            mesh_fluid,
-                            style="points",
-                            point_size=point_size,
-                            color="gray",
-                            opacity=0.5,
-                            name=f"fluid_{panel_key}",
-                        )
-                elif opts.fluidVisualization != VisualizeOptions.Hide:
-                    q = fluidQs
-                    fluid_range = _scalar_range(fluidQs, sharedNorm)
-                    if panel_state.mesh_fluid is not None and panel_state.actor_fluid is not None:
-                        mesh_fluid = panel_state.mesh_fluid
-                        actor_fluid = panel_state.actor_fluid
-                        mesh_fluid.points = pts
-                        mesh_fluid.point_data["quantity"] = q
-                        try:
-                            actor_fluid.mapper.scalar_range = fluid_range
-                        except Exception:
-                            pass
-                        try:
-                            actor_fluid.prop.point_size = point_size
-                        except Exception:
-                            pass
-                        if colormap_changed:
-                            actor_fluid = self._plotter.add_mesh(
-                                mesh_fluid,
-                                style="points",
-                                point_size=point_size,
-                                render_points_as_spheres=False,
-                                scalars="quantity",
-                                cmap=_cmap_name(opts),
-                                clim=fluid_range,
-                                show_scalar_bar=opts.showColorBar,
-                                scalar_bar_args={"title": panel_key},
-                                name=f"fluid_{panel_key}",
-                            )
-                    else:
-                        mesh_fluid = pv.PolyData(pts)
-                        mesh_fluid["quantity"] = q
-                        actor_fluid = self._plotter.add_mesh(
-                            mesh_fluid,
-                            style="points",
-                            point_size=point_size,
-                            render_points_as_spheres=False,
-                            scalars="quantity",
-                            cmap=_cmap_name(opts),
-                            clim=fluid_range,
-                            show_scalar_bar=opts.showColorBar,
-                            scalar_bar_args={"title": panel_key},
-                            name=f"fluid_{panel_key}",
-                        )
-                else:
-                    mesh_fluid = None
-                    actor_fluid = None
+            self._remove(s, f"domain_{key}")
+        title = opts.plotTitle or ""
+        if s.title is None:
+            from vtkmodules.vtkRenderingCore import vtkTextActor
 
-            if boundary.positions.shape[0] > 0:
-                pts = _to_3d(boundary.positions)
-                if opts.boundaryVisualization == VisualizeOptions.Passive:
-                    if panel_state.mesh_boundary is not None and panel_state.actor_boundary is not None:
-                        mesh_boundary = panel_state.mesh_boundary
-                        actor_boundary = panel_state.actor_boundary
-                        mesh_boundary.points = pts
-                        try:
-                            actor_boundary.prop.point_size = point_size
-                        except Exception:
-                            pass
-                    else:
-                        mesh_boundary = pv.PolyData(pts)
-                        actor_boundary = self._plotter.add_mesh(
-                            mesh_boundary,
-                            style="points",
-                            point_size=point_size,
-                            color="gray",
-                            opacity=0.5,
-                            name=f"boundary_{panel_key}",
-                        )
-                elif opts.boundaryVisualization != VisualizeOptions.Hide:
-                    q = boundaryQs
-                    boundary_range = _scalar_range(boundaryQs, sharedNorm)
-                    if panel_state.mesh_boundary is not None and panel_state.actor_boundary is not None:
-                        mesh_boundary = panel_state.mesh_boundary
-                        actor_boundary = panel_state.actor_boundary
-                        mesh_boundary.points = pts
-                        mesh_boundary.point_data["quantity"] = q
-                        try:
-                            actor_boundary.mapper.scalar_range = boundary_range
-                        except Exception:
-                            pass
-                        try:
-                            actor_boundary.prop.point_size = point_size
-                        except Exception:
-                            pass
-                        if colormap_changed:
-                            actor_boundary = self._plotter.add_mesh(
-                                mesh_boundary,
-                                style="points",
-                                point_size=point_size,
-                                render_points_as_spheres=False,
-                                scalars="quantity",
-                                cmap=_cmap_name(opts),
-                                clim=boundary_range,
-                                show_scalar_bar=False,
-                                name=f"boundary_{panel_key}",
-                            )
-                    else:
-                        mesh_boundary = pv.PolyData(pts)
-                        mesh_boundary["quantity"] = q
-                        actor_boundary = self._plotter.add_mesh(
-                            mesh_boundary,
-                            style="points",
-                            point_size=point_size,
-                            render_points_as_spheres=False,
-                            scalars="quantity",
-                            cmap=_cmap_name(opts),
-                            clim=boundary_range,
-                            show_scalar_bar=False,
-                            name=f"boundary_{panel_key}",
-                        )
-                else:
-                    mesh_boundary = None
-                    actor_boundary = None
+            s.title = vtkTextActor()
+            s.title.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+            s.title.SetPosition(0.5, 0.96)
+            prop = s.title.GetTextProperty()
+            prop.SetFontFamilyToArial()
+            prop.SetFontSize(
+                max(
+                    10,
+                    round(13 * self._plotter.window_size[1] / (480 * self._shape[0])),
+                )
+            )
+            prop.SetColor(0, 0, 0)
+            prop.SetJustificationToCentered()
+            prop.SetVerticalJustificationToTop()
+            self._plotter.add_actor(
+                s.title,
+                name=f"title_{key}",
+                reset_camera=False,
+                pickable=False,
+                render=False,
+            )
+            s.actors[f"title_{key}"] = s.title
+        s.title.GetTextProperty().SetFontSize(
+            max(10, round(13 * self._plotter.window_size[1] / (480 * self._shape[0])))
+        )
+        s.title.SetInput(title)
+        if opts.gridVisualization and opts.gridVisualization.streamLines:
+            if f.domain.dim != 2:
+                raise ValueError(
+                    "PyVista streamlines currently require a 2D vector grid."
+                )
+            from ..streamLines import streamlineSegments
 
-
-        panel_state.fluid_scalar_range = fluid_range
-        panel_state.mesh_fluid = mesh_fluid
-        panel_state.actor_fluid = actor_fluid
-        panel_state.mesh_boundary = mesh_boundary
-        panel_state.actor_boundary = actor_boundary
-        panel_state.boundary_scalar_range = boundary_range
-        panel_state.mesh_grid = mesh_grid
-        panel_state.actor_grid = actor_grid
-        panel_state.grid_scalar_range = grid_range
-        panel_state.fluidParticles = fluid
-        panel_state.boundaryParticles = boundary
-        panel_state.ghostParticles = ghost
-        panel_state.assembledQuantity = assembled
-        panel_state.rotatedQuantities = rotated_q
-        panel_state.options = opts
-
-        return panel_state
-
-    # -------------------------------------------------------------------------
-    # Export
-    # -------------------------------------------------------------------------
-
-    def export(self, filepath: str, **kwargs: Any) -> None:
-        """Export the scene to *filepath*.
-
-        The format is inferred from the file extension:
-
-        * **Raster** (``png``, ``jpg``, ``jpeg``, ``bmp``, ``tif``, ``tiff``):
-          uses :meth:`pyvista.Plotter.screenshot`.  Pass
-          ``transparent_background=True`` to get an alpha channel (PNG only).
-        * **Vector** (``svg``, ``eps``, ``ps``, ``pdf``):
-          uses :meth:`pyvista.Plotter.save_graphic`.
-
-        Note
-        ----
-        PyVista is a pixel-based renderer; ``dpi`` has no meaning here and is
-        silently ignored.  Use the ``window_size`` option when creating the
-        figure to control the output resolution instead.
-        """
-        if self._plotter is None:
-            raise RuntimeError("No plotter to export; call create_figure first.")
-        import os
-        ext = os.path.splitext(filepath)[1].lower().lstrip(".")
-        vector_exts = {"svg", "eps", "ps", "pdf"}
-        kwargs.pop("dpi", None)  # not meaningful for a pixel-based renderer
-        if ext in vector_exts:
-            allowed = {"title", "raster", "painter"}
-            self._plotter.save_graphic(filepath, **{k: v for k, v in kwargs.items() if k in allowed})
+            vg, vq, vn, ve = mapFrameToGrid(f, f.streamlineQuantity)
+            segments = streamlineSegments(vg, vq, vn, ve)
+            self._remove(s, f"stream_{key}")
+            if len(segments):
+                pts = np.column_stack(
+                    (
+                        segments.reshape(-1, 2),
+                        np.full(
+                            segments.size // 2,
+                            float((f.domain.max - f.domain.min).max()) * 1e-4,
+                        ),
+                    )
+                )
+                lines = np.column_stack(
+                    (
+                        np.full(len(segments), 2),
+                        np.arange(0, len(pts), 2),
+                        np.arange(1, len(pts), 2),
+                    )
+                ).ravel()
+                s.actors[f"stream_{key}"] = self._plotter.add_mesh(
+                    pv.PolyData(pts, lines=lines),
+                    color="black",
+                    line_width=1,
+                    lighting=False,
+                    name=f"stream_{key}",
+                    reset_camera=False,
+                    render=False,
+                )
         else:
-            allowed = {"window_size", "transparent_background", "return_img"}
-            self._plotter.screenshot(filepath, **{k: v for k, v in kwargs.items() if k in allowed})
+            self._remove(s, f"stream_{key}")
+        self._colorbar(key, s, norm, opts)
+        display_axes = tuple(f.displayAxes or range(f.domain.dim))
+        if changed or display_axes != getattr(s, "displayAxes", None):
+            self._plotter.remove_bounds_axes()
+            fit = view_domain(f)
+            bounds = np.column_stack((fit.min.cpu(), fit.max.cpu())).ravel()
+            if f.domain.dim == 2:
+                # Keep the plotting frame separate from the physical domain
+                # and the interpolated grid, including external wall particles.
+                bounds = np.r_[bounds, 0.0, 0.0].astype(float)
+                for actor in (s.actor_fluid, s.actor_boundary):
+                    if actor is not None:
+                        b = np.asarray(actor.bounds)
+                        bounds[::2] = np.minimum(bounds[::2], b[::2])
+                        bounds[1::2] = np.maximum(bounds[1::2], b[1::2])
+                pad = max(bounds[1] - bounds[0], bounds[3] - bounds[2]) * 0.035
+                bounds[:4] += np.array([-pad, pad, -pad, pad])
+                x0, x1, y0, y1 = bounds[:4]
+                frame = pv.lines_from_points(
+                    np.array(
+                        [
+                            [x0, y0, 0],
+                            [x1, y0, 0],
+                            [x1, y1, 0],
+                            [x0, y1, 0],
+                            [x0, y0, 0],
+                        ]
+                    )
+                )
+                self._remove(s, f"frame_{key}")
+                s.actors[f"frame_{key}"] = self._plotter.add_mesh(
+                    frame,
+                    color=(0.35, 0.35, 0.35),
+                    line_width=1,
+                    lighting=False,
+                    name=f"frame_{key}",
+                    reset_camera=False,
+                    render=False,
+                )
+            else:
+                self._remove(s, f"frame_{key}")
+            s.frameBounds = bounds
+            s.boundsAxes = self._plotter.show_bounds(
+                bounds=bounds,
+                show_zaxis=f.domain.dim == 3,
+                show_zlabels=f.domain.dim == 3,
+                xtitle="XYZ"[(f.displayAxes or [0, 1])[0]],
+                ytitle="XYZ"[(f.displayAxes or [0, 1])[1]],
+                ztitle="Z",
+                font_size=10,
+                bold=False,
+                fmt="%.3g",
+                location="outer",
+                ticks="both",
+                grid=False,
+                render=False,
+            )
+        s.displayAxes = display_axes
+        has_bar = opts.showColorBar and norm is not None
+        offset = (
+            (0.0, -0.22)
+            if getattr(s, "barOrientation", "vertical") == "horizontal"
+            else (0.14, 0.0)
+        )
+        if changed:
+            if f.domain.dim == 2:
+                self._plotter.view_xy(render=False)
+                self._plotter.enable_parallel_projection()
+            elif dimension_changed:
+                self._plotter.disable_parallel_projection()
+                self._plotter.view_isometric(render=False)
+            self._plotter.camera.SetWindowCenter(0.0, 0.0)
+            self._plotter.reset_camera(
+                bounds=s.frameBounds if opts.dynamicBounds else None, render=False
+            )
+            if has_bar:
+                self._plotter.camera.zoom(0.85)
+                self._plotter.camera.SetWindowCenter(*offset)
+        s.particleDiameters = {
+            kind: particle_diameter(particles, opts)
+            for kind, particles, variant in (
+                ("fluid", f.fluid, opts.fluidVisualization),
+                ("boundary", f.boundary, opts.boundaryVisualization),
+            )
+            if opts.markerSize is None
+            and "point_size" not in self._opts
+            and opts.gridVisualization is None
+            and variant != VisualizeOptions.Hide
+        }
+        s.domain = f.domain
+        s.options = opts
+        s.assembledQuantity = f.assembled
+        s.rotatedQuantities = f.particles.quantities
+        s.fluidParticles, s.boundaryParticles, s.ghostParticles = (
+            f.fluid,
+            f.boundary,
+            f.ghost,
+        )
+        interaction_dimension = (
+            3 if any(state.domain.dim == 3 for state in self._states.values()) else 2
+        )
+        if interaction_dimension != self._interaction_dimension:
+            if interaction_dimension == 2:
+                self._plotter.enable_2d_style()
+            else:
+                self._plotter.enable_trackball_style()
+            self._interaction_dimension = interaction_dimension
+        return s
 
-    # -------------------------------------------------------------------------
-    # Display
-    # -------------------------------------------------------------------------
+    def _colorbar(self, key, s, norm, opts):
+        from vtkmodules.vtkRenderingAnnotation import vtkScalarBarActor
+        from vtkmodules.vtkRenderingCore import vtkTextActor
 
-    def show(self) -> None:
-        """Flush / display the scene.
+        custom = self._opts.get("scalar_bar", {})
+        horizontal = custom.get("orientation", "vertical") == "horizontal"
+        style = dict(
+            orientation="vertical",
+            position=None,
+            width=None,
+            height=None,
+            label_rotation=0.0,
+            title_rotation=0.0,
+            font_size=max(
+                10, round(12 * self._plotter.window_size[1] / (480 * self._shape[0]))
+            ),
+            title_font_size=max(
+                10, round(12 * self._plotter.window_size[1] / (480 * self._shape[0]))
+            ),
+            n_labels=3,
+            label_format=".6g",
+            title="",
+        )
+        if custom.keys() - style.keys():
+            raise TypeError(
+                f"Unknown scalar_bar options: {sorted(custom.keys()-style.keys())}"
+            )
+        style.update(custom)
+        if int(style["n_labels"]) < 2:
+            raise ValueError("scalar_bar.n_labels must be >= 2")
+        if style["orientation"] not in ("horizontal", "vertical"):
+            raise ValueError("scalar_bar.orientation must be horizontal or vertical")
+        x, y = style["position"] or ((0.15, 0.10) if horizontal else (0.84, 0.15))
+        width = (
+            style["width"]
+            if style["width"] is not None
+            else (0.68 if horizontal else 0.035)
+        )
+        height = (
+            style["height"]
+            if style["height"] is not None
+            else (0.035 if horizontal else 0.68)
+        )
+        if (
+            not np.isfinite([x, y, width, height]).all()
+            or min(x, y) < 0
+            or min(width, height) <= 0
+            or x + width > 1
+            or y + height > 1
+        ):
+            raise ValueError(
+                "scalar_bar position/size must fit inside normalized viewport bounds"
+            )
+        s.barOrientation = style["orientation"]
+        if not opts.showColorBar or norm is None:
+            for name in [n for n in s.actors if n.startswith(f"cb_{key}_")]:
+                self._remove(s, name)
+            s.colorbar = None
+            s.labels = []
+            s._barSignature = None
+            return
+        viewport_size = self._plotter.renderer.GetSize()
+        frame_right = None
+        if (
+            not horizontal
+            and style["position"] is None
+            and s.domain.dim == 2
+            and hasattr(s, "frameBounds")
+        ):
+            renderer = self._plotter.renderer
+            x0, x1, y0, y1 = s.frameBounds[:4]
+            edges = []
+            for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+                renderer.SetWorldPoint(float(px), float(py), 0.0, 1.0)
+                renderer.WorldToDisplay()
+                edges.append(renderer.GetDisplayPoint()[0] - renderer.GetOrigin()[0])
+            frame_right = max(edges)
+        signature = (
+            s.normSignature,
+            tuple(sorted(style.items())),
+            viewport_size,
+            frame_right,
+        )
+        if getattr(s, "_barSignature", None) == signature:
+            return
+        if s.colorbar is None:
+            bar = vtkScalarBarActor()
+            # VTK otherwise reserves internal text space even with labels off,
+            # shrinking the strip away from the separate physical tick labels.
+            bar.SetBarRatio(1.0)
+            bar.SetTextPad(0)
+            bar.SetTitleRatio(0.0)
+            bar.SetMaximumNumberOfColors(256)
+            bar.SetTitle("")
+            bar.DrawTickLabelsOff()
+            bar.DrawAnnotationsOff()
+            self._plotter.add_actor(
+                bar,
+                name=f"cb_{key}_bar",
+                reset_camera=False,
+                pickable=False,
+                render=False,
+            )
+            s.actors[f"cb_{key}_bar"] = bar
+            s.colorbar = bar
+        s.colorbar.SetLookupTable(s.lookup)
+        (
+            s.colorbar.SetOrientationToHorizontal()
+            if horizontal
+            else s.colorbar.SetOrientationToVertical()
+        )
+        count = int(style["n_labels"])
+        if len(s.labels) != count + 1:
+            for name in [n for n in s.actors if n.startswith(f"cb_{key}_text")]:
+                self._remove(s, name)
+            s.labels = []
+            for i in range(count + 1):
+                label = vtkTextActor()
+                label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+                prop = label.GetTextProperty()
+                prop.SetFontFamilyToArial()
+                prop.BoldOff()
+                prop.ItalicOff()
+                prop.ShadowOff()
+                prop.SetColor(0, 0, 0)
+                prop.SetJustificationToCentered()
+                prop.SetVerticalJustificationToCentered()
+                self._plotter.add_actor(
+                    label,
+                    name=f"cb_{key}_text{i}",
+                    reset_camera=False,
+                    pickable=False,
+                    render=False,
+                )
+                s.actors[f"cb_{key}_text{i}"] = label
+                s.labels.append(label)
+        # The bar uses normalized coordinates; inverse ticks retain physical
+        # units while giving nonlinear scales their full color distribution.
+        values = norm.inverse(np.linspace(0, 1, count))
+        for label, value in zip(s.labels, values):
+            label.SetInput(format(float(value), style["label_format"]))
+            label.GetTextProperty().SetOrientation(float(style["label_rotation"]))
+            label.GetTextProperty().SetFontSize(int(style["font_size"]))
+        # Reserve the measured text width, including when a window is resized
+        # or changed limits produce longer numbers. Keep explicit positions.
+        if not horizontal and style["position"] is None:
+            sizes = []
+            for label in s.labels[:-1]:
+                size = [0.0, 0.0]
+                label.GetSize(self._plotter.renderer, size)
+                sizes.append(size[0])
+            x = min(x, 1.0 - width - (max(sizes) + 12) / max(1, viewport_size[0]))
+            if frame_right is not None:
+                x = min(x, max(0.0, (frame_right + 12) / max(1, viewport_size[0])))
+        s.colorbar.SetPosition(x, y)
+        s.colorbar.SetWidth(width)
+        s.colorbar.SetHeight(height)
+        gap_x = 5.0 / max(1, viewport_size[0])
+        gap_y = (style["font_size"] / 2 + 5) / max(1, viewport_size[1])
+        for i, label in enumerate(s.labels[:-1]):
+            (
+                label.SetPosition(x + width * i / (count - 1), y - gap_y)
+                if horizontal
+                else label.SetPosition(x + width + gap_x, y + height * i / (count - 1))
+            )
+            if horizontal or style["label_rotation"]:
+                label.GetTextProperty().SetJustificationToCentered()
+            else:
+                label.GetTextProperty().SetJustificationToLeft()
+        title = s.labels[-1]
+        title.SetInput(str(style["title"]))
+        title.SetPosition(x + width / 2, y + height + 0.06)
+        title.GetTextProperty().SetOrientation(float(style["title_rotation"]))
+        title.GetTextProperty().SetFontSize(int(style["title_font_size"]))
+        s._barSignature = signature
 
-        Behaviour depends on *jupyter_backend*:
-
-        ``"static"`` (default)
-            Renders offscreen, captures a screenshot, and displays it as an
-            inline PNG in the current Jupyter cell.  Safe to call repeatedly;
-            each call produces a fresh image reflecting the latest data.
-        ``"trame"``
-            The first call attaches an interactive widget to the notebook cell.
-            Subsequent calls call ``plotter.render()`` to push data changes to
-            the live widget.
-        ``"none"`` or anything else
-            Opens a native pop-out window on the first call; subsequent calls
-            are no-ops.
-        """
+    def _refresh_layout(self, *_):
+        """Keep text inside each viewport on export and interactive resize."""
         if self._plotter is None:
             return
+        # VTK's multisample resolve leaves white fringes around thin lines
+        # over an image surface. Single-sample 2D overlays retain the actual
+        # background colors instead. Restore the window setting when removed.
+        has_streamlines = any(
+            s.domain.dim == 2
+            and s.options.gridVisualization
+            and s.options.gridVisualization.streamLines
+            for s in self._states.values()
+        )
+        window = self._plotter.render_window
+        if has_streamlines and self._streamline_multisamples is None:
+            self._streamline_multisamples = window.GetMultiSamples()
+            window.SetMultiSamples(0)
+        elif not has_streamlines and self._streamline_multisamples is not None:
+            window.SetMultiSamples(self._streamline_multisamples)
+            self._streamline_multisamples = None
+        active = self._plotter.renderers.active_index
+        try:
+            if self._title_actor is not None and (
+                self._title_layout[1] != self._plotter.window_size[1]
+            ):
+                self.update_figure_title(self._title_text)
+            for key, s in self._states.items():
+                self._plotter.subplot(s.row, s.col)
+                self._colorbar(key, s, s.norm, s.options)
+                self._resize_particles(key, s)
+        finally:
+            self._plotter.subplot(*divmod(active, self._shape[1]))
 
+    @serialized_notebook_render
+    def show(self):
+        if self._plotter is None:
+            return
         if self._jupyter_backend == "static":
-            # Render to the offscreen buffer and capture a screenshot.
-            # On first call, create an IPython display handle tied to this
-            # output cell.  On subsequent calls, call handle.update() so the
-            # image is replaced in-place rather than appended as a new output.
+            self._plotter.render()
             try:
-                self._plotter.render()
-                img = np.ascontiguousarray(self._plotter.screenshot(return_img=True))
-            except KeyboardInterrupt:
-                return
-            try:
-                from IPython.display import display, Image as IPImage  # noqa: PLC0415
-                import io, PIL.Image  # noqa: PLC0415
+                from IPython import get_ipython
 
-                buf = io.BytesIO()
-                PIL.Image.fromarray(img).save(buf, format="PNG")
-                ipy_img = IPImage(data=buf.getvalue())
-
-                if self._display_handle is None:
-                    # display_id=True returns a DisplayHandle whose .update()
-                    # method replaces this output in-place in the notebook.
-                    self._display_handle = display(ipy_img, display_id=True)
-                else:
-                    self._display_handle.update(ipy_img)
+                ip = get_ipython()
             except ImportError:
-                pass  # Non-notebook environment — screenshot captured but not shown.
-        elif self._jupyter_backend == "trame":
-            import pyvista as pv  # noqa: PLC0415
+                ip = None
+            if ip is not None and "IPKernelApp" in getattr(ip, "config", {}):
+                import io
+                from PIL import Image
+                from IPython.display import display, Image as IPImage
 
-            if not self._shown:
-                try:
-                    pv.set_jupyter_backend("trame")
-                    # Keep the trame viewer open so subsequent updateQuantities
-                    # calls can push incremental frames into the same widget.
-                    self._trame_view = self._plotter.show(
-                        jupyter_backend="trame",
-                        auto_close=False,
-                    )
-                    self._shown = True
-                except Exception:
-                    # trame not installed; fall back to static screenshot.
-                    self._jupyter_backend = "static"
-                    self.show()
-            else:
-                # render() pushes scene changes into the active trame view.
-                try:
-                    self._plotter.render()
-                except KeyboardInterrupt:
-                    return
-
-                # If available, nudge the trame-side view to push a fresh
-                # frame immediately rather than waiting for notebook idle.
-                try:
-                    if self._trame_view is not None:
-                        updater = getattr(self._trame_view, "update", None)
-                        if callable(updater):
-                            updater()
-                except Exception:
-                    pass
-        else:
-            # Pop-out native window.
-            # Pass jupyter_backend='none' directly to show() — this overrides
-            # any global PyVista Jupyter setting without side-effects on other
-            # plotters.  interactive_update=True returns immediately after
-            # opening the window.  plotter.update() is then called to flush
-            # the render queue and make the window visible on WSLg.
-            if not self._shown:
-                self._plotter.show(
-                    jupyter_backend="none",
-                    interactive_update=True,
-                    auto_close=False,
+                buffer = io.BytesIO()
+                Image.fromarray(self._plotter.screenshot(return_img=True)).save(
+                    buffer, format="PNG"
                 )
-                self._plotter.update()  # flush so WSLg actually paints the window
-                self._shown = True
+                output = IPImage(data=buffer.getvalue())
+                if self._display_handle is None:
+                    self._display_handle = display(output, display_id=True)
+                else:
+                    self._display_handle.update(output)
+        elif self._jupyter_backend == "trame":
+            if not self._shown:
+                notebook_options = {
+                    "mode": "server",
+                    "width": "100%",
+                    **self._opts.get("jupyter_kwargs", {}),
+                }
+                if self._trame_context_guard is None:
+                    self._trame_context_guard = register_trame_window(
+                        self._plotter, self._render_lock, notebook_options.get("name")
+                    )
+                self._plotter.show(
+                    jupyter_backend="trame",
+                    auto_close=False,
+                    jupyter_kwargs=notebook_options,
+                )
             else:
-                self._plotter.update()
+                self._plotter.render()
+        elif not self._shown:
+            self._plotter.show(interactive_update=True, auto_close=False)
+        else:
+            self._plotter.update()
+        self._shown = True
+        # Do not leave GLX/EGL bound when another plotting backend draws next.
+        self._plotter.render_window.ReleaseCurrent()
 
-    # -------------------------------------------------------------------------
-    # Capability flags
-    # -------------------------------------------------------------------------
+    @serialized_notebook_render
+    def update_figure_title(self, title):
+        if self._plotter is None:
+            return
+        from vtkmodules.vtkRenderingCore import vtkRenderer, vtkTextActor
 
-    @property
-    def supports_grid(self) -> bool:
-        return True
+        text = title or ""
+        self._title_text = text
+        self._plotter.title = text or "warpSPHPlotting"
+        if self._title_renderer is None and not text:
+            return
+        if self._title_renderer is None:
+            renderer = vtkRenderer()
+            layer = self._plotter.render_window.GetNumberOfLayers()
+            renderer.SetLayer(layer)
+            renderer.SetInteractive(False)
+            renderer.SetPreserveColorBuffer(False)
+            renderer.SetBackground(1, 1, 1)
+            renderer.SetBackgroundAlpha(1)
+            self._plotter.render_window.SetNumberOfLayers(layer + 1)
+            self._plotter.render_window.AddRenderer(renderer)
+            actor = vtkTextActor()
+            actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+            actor.SetPosition(0.5, 0.99)
+            prop = actor.GetTextProperty()
+            prop.SetFontFamilyToArial()
+            prop.SetFontSize(12)
+            prop.SetColor(0, 0, 0)
+            prop.SetJustificationToCentered()
+            prop.SetVerticalJustificationToTop()
+            renderer.AddViewProp(actor)
+            self._title_actor, self._title_renderer = actor, renderer
+        self._title_actor.SetInput(text)
+        lines = text.count("\n") + 1 if text else 0
+        height = self._plotter.window_size[1]
+        if (lines, height) != self._title_layout:
+            font_size = max(10, round(12 * height / 480))
+            self._title_actor.GetTextProperty().SetFontSize(font_size)
+            band = min(0.4, (1.5 * font_size * lines + 8) / height) if lines else 0.0
+            rows, cols = self._shape
+            for key, (r, c) in self._axes.items():
+                self._plotter.subplot(r, c)
+                r0, c0, r1, c1 = self._spans[key]
+                self._plotter.renderer.SetViewport(
+                    c0 / cols,
+                    (1 - (r1 + 1) / rows) * (1 - band),
+                    (c1 + 1) / cols,
+                    (1 - r0 / rows) * (1 - band),
+                )
+            self._title_renderer.SetDraw(bool(text))
+            if text:
+                self._title_renderer.SetViewport(0.0, 1.0 - band, 1.0, 1.0)
+                self._title_actor.SetPosition(0.5, 0.92)
+            self._title_lines = lines
+            self._title_layout = (lines, height)
 
-    @property
-    def supports_streamlines(self) -> bool:
-        # Phase 3: VTK streamline filter deferred to a follow-up
-        return False
+    @serialized_notebook_render
+    def export(self, filepath, **kwargs):
+        if self._plotter is None:
+            raise RuntimeError("No open PyVista figure to export.")
+        from pathlib import Path
 
-    @property
-    def supports_notebook_inline(self) -> bool:
-        return True  # via static screenshot or trame widget
+        try:
+            self._refresh_layout()
+            # screenshot() can reuse the last rendered buffer after in-place
+            # mesh/title edits. Render explicitly so every exported frame is current.
+            self._plotter.render()
+
+            kwargs.pop("dpi", None)
+            if Path(filepath).suffix.lower() in (".svg", ".pdf", ".eps", ".ps"):
+                self._plotter.save_graphic(filepath, **kwargs)
+            else:
+                self._plotter.screenshot(filepath, **kwargs)
+        finally:
+            self._plotter.render_window.ReleaseCurrent()
+
+    @serialized_notebook_render
+    def close(self):
+        if self._plotter is not None:
+            if self._trame_context_guard is not None:
+                self._trame_context_guard.remove(self._plotter.render_window)
+                self._trame_context_guard = None
+            self._plotter.render_window.RemoveObserver(self._layout_observer)
+            self._plotter.close()
+            self._states.clear()
+            self._title_actor = self._title_renderer = None
+            self._streamline_multisamples = None
+            self._plotter = None
+
+    supports_grid = property(lambda self: True)
+    supports_streamlines = property(lambda self: True)
+    supports_notebook_inline = property(lambda self: True)

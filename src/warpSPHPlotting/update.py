@@ -1,223 +1,149 @@
-from matplotlib.collections import PathCollection
-from matplotlib.colorbar import Colorbar
-from matplotlib.streamplot import StreamplotSet
-from warpSPHCore import *
+"""Matplotlib updates, using the same preparation as every other backend."""
+
+import copy
+from .state import VisualizationState
+from .enumTypes import VisualizeOptions
 from .domain import processDomain
-from .grid import generateGrid, mapToGrid, updateGridVisualize
-from .scatter import updateScatterVisualize
-from .streamLines import updateStreamLinePlot
-from .state import PlottingParticleState, rotateState, filterState
-from .options import PlottingOptions
-from .math import getBounds, buildRotationMatrix, mapQuantity
-from .enumTypes import VisualizeOptions, Mapping, StreamLineLocation
-from typing import Optional, Tuple
-import torch
-import matplotlib.colors as colors
-from matplotlib.collections import PathCollection
-from matplotlib.colorbar import Colorbar
-from .util import verbosePrint
-from .state import VisualizationState, assembleQuantity
-    
-def updatePlot(plotState, 
-        particles: ParticleState,
-        quantity: Optional[torch.Tensor] = None, 
-        **kwargs):
-    options = plotState.options
-    for arg in kwargs:
-        if hasattr(options, arg):
-            setattr(options, arg, kwargs[arg])
+from .math import getSharedBounds
+from .scatter import updateScatterVisualize, removeResult
+from .grid import mapFrameToGrid, updateGridVisualize
+from .streamLines import updateStreamLinePlot, removeStreamLines
+from .backends._render_util import prepare_frame, view_needs_refit, view_domain
 
-    fig, axis = plotState.fig, plotState.axis
-    domain = plotState.domain
-    domain_, rotMat, invRotMat = processDomain(fig, axis, domain, options, (particles.masses / particles.densities).mean().item())  
 
-    assembledQuantity = plotState.assembledQuantity if quantity is None else assembleQuantity(particles, quantity)
-    particlePlotState = PlottingParticleState(
-        positions = particles.positions,
-        supports = particles.supports,
-        masses = particles.masses,
-        densities = particles.densities,
-        kinds = particles.kinds,
-        quantities = assembledQuantity
+def _renderFrame(state, frame, initial=False):
+    options = frame.options
+    old_domain = state.domain
+    changed = initial or view_needs_refit(
+        old_domain, frame, getattr(state, "displayAxes", tuple(range(old_domain.dim)))
     )
-    # We are rotating the state back to the original orientation for filtering thus we are using the inverse rotation matrix
-    rotatedState = rotateState(particlePlotState, invRotMat)
-    rotatedState.quantities = assembledQuantity if quantity is None else rotatedState.quantities
-    streamLineQuantity = None
-
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.BeforeOperation:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Apply the operation properties to the quantities if specified in the options
-
-    if options.plottingOperation is not None:
-        if not isinstance(options.plottingOperation, list):
-            operationProperties = [options.plottingOperation]
-        else:
-            operationProperties = options.plottingOperation
-        for o, op in enumerate(operationProperties):
-            rotatedState.quantities = warpOperation(
-                queryParticles = rotatedState,
-                queryValues = rotatedState.quantities,
-                operationProperties = op,
-                adjacency = None, # We can consider adding adjacency-based operations in the future
-                domain = domain_
-            )
-            
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.BeforeMapping:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Apply mapping to the quantities if specified in the options
-    if options.mapping != Mapping.none:
-        rotatedState.quantities = mapQuantity(rotatedState.quantities, options.mapping)
-        
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.AfterMapping:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Checking quantity shape
-    if rotatedState.quantities.shape[0] != rotatedState.positions.shape[0]:
-        raise ValueError(f"Quantity length {rotatedState.quantities.shape[0]} does not match number of particles {rotatedState.positions.shape[0]} after applying plotting operation.")
-    if rotatedState.quantities.ndim == 2:
-        raise ValueError(f"Quantity has more than 1 component per particle (shape: {rotatedState.quantities.shape}). Please specify how to map the quantity to a scalar value for visualization (e.g., using options.mapping) or ensure the plotting operation returns a single scalar value per particle.")
-
-    fluidParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Fluid) 
-    boundaryParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Boundary)
-    ghostParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Ghost)
-
+    processDomain(state.fig, state.axis, frame.domain, options, 0, resetLimits=False)
+    if changed:
+        fit = view_domain(frame)
+        eps = (fit.max - fit.min) * options.domainEpsilon
+        state.axis.set_xlim(float(fit.min[0] - eps[0]), float(fit.max[0] + eps[0]))
+        state.axis.set_ylim(float(fit.min[1] - eps[1]), float(fit.max[1] + eps[1]))
+    state.displayAxes = tuple(frame.displayAxes or range(frame.domain.dim))
+    fig, ax = state.fig, state.axis
+    if frame.displayAxes is not None:
+        ax.set_xlabel("XYZ"[frame.displayAxes[0]])
+        ax.set_ylabel("XYZ"[frame.displayAxes[1]])
     if options.gridVisualization is None:
-        fluidVisualized = options.fluidVisualization == VisualizeOptions.Visualize and fluidParticles.positions.shape[0] > 0
-        boundaryVisualized = options.boundaryVisualization == VisualizeOptions.Visualize and boundaryParticles.positions.shape[0] > 0
-
-        fluidQs = None
-        boundaryQs = None
-        sharedNorm = None
-        if fluidVisualized and boundaryVisualized:
-            combinedQuantity = torch.cat((fluidParticles.quantities, boundaryParticles.quantities), dim=0)
-            combinedQs, sharedNorm = getBounds(combinedQuantity, options)
-            fluidCount = fluidParticles.quantities.shape[0]
-            fluidQs = combinedQs[:fluidCount]
-            boundaryQs = combinedQs[fluidCount:]
-
-        colorBarOnFluid = fluidVisualized
-        colorBarOnBoundary = (not fluidVisualized) and boundaryVisualized
-
-        plotState.fluidScatterResult = updateScatterVisualize(
-            plotState.fluidScatterResult,
-            fig,
-            axis,
-            fluidParticles,
-            domain_,
-            options,
-            variant=options.fluidVisualization,
-            precomputedQs=fluidQs,
-            precomputedNorm=sharedNorm,
-            attachColorBar=colorBarOnFluid,
+        removeResult(state.gridResult)
+        state.gridResult = None
+        removeStreamLines(state.streamLines)
+        state.streamLines = None
+        fv = (
+            options.fluidVisualization == VisualizeOptions.Visualize
+            and len(frame.fluid.positions) > 0
         )
-        plotState.boundaryScatterResult = updateScatterVisualize(
-            plotState.boundaryScatterResult,
-            fig,
-            axis,
-            boundaryParticles,
-            domain_,
-            options,
-            variant=options.boundaryVisualization,
-            precomputedQs=boundaryQs,
-            precomputedNorm=sharedNorm,
-            attachColorBar=colorBarOnBoundary,
+        bv = (
+            options.boundaryVisualization == VisualizeOptions.Visualize
+            and len(frame.boundary.positions) > 0
         )
-        plotState.ghostScatterResult = updateScatterVisualize(
-            plotState.ghostScatterResult,
-            fig,
-            axis,
-            ghostParticles,
-            domain_,
+        fq, bq, norm = frame.sharedBounds or getSharedBounds(
+            frame.fluid.quantities if fv else None,
+            frame.boundary.quantities if bv else None,
             options,
-            variant=VisualizeOptions.Hide,
+        )
+        state.fluidScatterResult = updateScatterVisualize(
+            state.fluidScatterResult,
+            fig,
+            ax,
+            frame.fluid,
+            frame.domain,
+            options,
+            options.fluidVisualization,
+            fq,
+            norm,
+            fv,
+        )
+        state.boundaryScatterResult = updateScatterVisualize(
+            state.boundaryScatterResult,
+            fig,
+            ax,
+            frame.boundary,
+            frame.domain,
+            options,
+            options.boundaryVisualization,
+            bq,
+            norm,
+            not fv and bv,
         )
     else:
-        gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-            particleState = rotatedState,
-            quantity = rotatedState.quantities,
-            domain = domain_,
-            nx = options.gridVisualization.resolution,
-            targetNeighbors = 50,
-            kernel = options.plottingKernel,
-            alignment = 'center',
-            includeFluid = options.fluidVisualization != VisualizeOptions.Hide,
-            includeBoundary = options.boundaryVisualization != VisualizeOptions.Hide,
-            gridMode = options.gridVisualization.gridSupport
+        removeResult(state.fluidScatterResult)
+        removeResult(state.boundaryScatterResult)
+        state.fluidScatterResult = state.boundaryScatterResult = None
+        gs, gq, n, ext = mapFrameToGrid(frame, frame.particles.quantities)
+        state.gridResult = updateGridVisualize(
+            state.gridResult, fig, ax, gs, gq, n, ext, options
         )
-
-        updateGridVisualize(plotState.gridResult, fig, axis, gridState, gridQuantity, nxs, gridExtent, options)
-        
         if options.gridVisualization.streamLines:
-            if options.gridVisualization.streamLineOperation is not None:
-                streamLineQuantity = warpOperation(
-                    queryParticles = rotatedState,
-                    queryValues = streamLineQuantity,
-                    operationProperties = OperationProperties(
-                        kernel = options.plottingKernel,
-                        operation = options.gridVisualization.streamLineOperation,
-                        gradientMode = options.gridVisualization.streamLineGradientMode,
-                        laplacianMode = options.gridVisualization.streamLineLaplaceMode,  
-                        operationMode = OperationDirection.NoGhost
-                    ),
-                    adjacency = None, # We can consider adding adjacency-based operations in the future
-                    domain = domain_
-                )
-
-            streamLineGridState, streamLineGridQuantity, streamLinenxs, streamLineGridExtent = mapToGrid(
-                particleState = rotatedState,
-                quantity = streamLineQuantity,
-                domain = domain_,
-                nx = options.gridVisualization.resolution,
-                targetNeighbors = 50,
-                kernel = options.plottingKernel,
-                alignment = 'center',
-                includeFluid = options.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary = options.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode = options.gridVisualization.gridSupport
+            vs, vq, vn, ve = mapFrameToGrid(frame, frame.streamlineQuantity)
+            state.streamLines = updateStreamLinePlot(
+                state.streamLines, fig, ax, vs, vq, vn, ve, options
             )
-
-            streamLines = updateStreamLinePlot(plotState.streamLines, fig, axis, streamLineGridState, streamLineGridQuantity, streamLinenxs, streamLineGridExtent, options)
-            plotState.streamLines = streamLines
         else:
-            streamLines = None
+            removeStreamLines(state.streamLines)
+            state.streamLines = None
+    ax.set_title(
+        options.plotTitle or "",
+        **({"pad": options.plotTitleGap} if options.plotTitleGap is not None else {}),
+    )
+    state.domain = frame.domain
+    state.options = options
+    state.assembledQuantity = frame.assembled
+    state.fluidParticles, state.boundaryParticles, state.ghostParticles = (
+        frame.fluid,
+        frame.boundary,
+        frame.ghost,
+    )
+    return state
 
-    plotState.fluidParticles = fluidParticles
-    plotState.boundaryParticles = boundaryParticles
-    plotState.ghostParticles = ghostParticles
-    plotState.assembledQuantity = assembledQuantity
 
-    if options.plotTitle is not None:
-        if options.plotTitleGap is not None:
-            axis.set_title(options.plotTitle, pad=float(options.plotTitleGap))
-        else:
-            axis.set_title(options.plotTitle)
+def updatePlot(
+    plotState,
+    particles,
+    quantity=None,
+    domain=None,
+    options=None,
+    _preparedFrame=None,
+    resetView=False,
+    **kwargs,
+):
+    requested = copy.deepcopy(options if options is not None else plotState.options)
+    for key, value in kwargs.items():
+        if not hasattr(requested, key):
+            raise TypeError(f"Unknown plotting option: {key}")
+        setattr(requested, key, value)
+    original_domain = (
+        domain
+        if domain is not None
+        else getattr(plotState, "_sourceDomain", plotState.domain)
+    )
+    frame = _preparedFrame or prepare_frame(
+        particles,
+        original_domain,
+        plotState.assembledQuantity if quantity is None else quantity,
+        requested,
+    )
+    frame.resetView |= resetView
+    result = _renderFrame(plotState, frame)
+    result._sourceDomain = original_domain
+    return result
 
-    return plotState
-
-
-
-from typing import Union, Dict, Tuple, Optional, Any
-from .state import VisualizationState
 
 def updateVisualization(
-    plotStates: Dict[str, VisualizationState],
-    particleState: Any,
-    domain: DomainDescription,
-    quantities: Union[torch.Tensor, Dict[str, torch.Tensor]],
-    newOptions: Optional[Dict[str, Dict[str, Any]]],
-    **kwargs):
-    newStates = {}
-    for key, plotState in plotStates.items():
-        newState = updatePlot(
-            plotState,
-            particles = particleState,
-            domain = domain,
-            quantity = quantities[key] if isinstance(quantities, dict) else quantities,
-            **(newOptions[key] if newOptions is not None and key in newOptions else {}),
-            **kwargs
+    plotStates, particleState, domain, quantities, newOptions=None, **kwargs
+):
+    return {
+        key: updatePlot(
+            state,
+            particleState,
+            quantities[key] if isinstance(quantities, dict) else quantities,
+            domain=domain,
+            **((newOptions or {}).get(key, {})),
+            **kwargs,
         )
-        newStates[key] = newState
-    return newStates
+        for key, state in plotStates.items()
+    }

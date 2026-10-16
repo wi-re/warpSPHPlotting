@@ -130,6 +130,50 @@ class AbstractBackend(ABC):
             f"The '{type(self).__name__}' backend does not support export."
         )
 
+    def validate_frame(self, frame):
+        """Validate common capabilities before changing any renderer objects."""
+        from ..enumTypes import VisualizeOptions
+        from ..math import getSharedBounds
+
+        if frame.options.gridVisualization and not self.supports_grid:
+            raise ValueError(f"{type(self).__name__} does not support grids.")
+        if (
+            frame.options.gridVisualization
+            and frame.options.gridVisualization.streamLines
+            and not self.supports_streamlines
+        ):
+            raise ValueError(f"{type(self).__name__} does not support streamlines.")
+        if frame.domain.dim == 3 and type(self).__name__ == "MatplotlibBackend":
+            raise ValueError(
+                "Matplotlib particle rendering requires a 2D domain; use PyVista for 3D."
+            )
+        if (
+            frame.domain.dim == 3
+            and frame.options.gridVisualization
+            and type(self).__name__ == "VispyBackend"
+        ):
+            raise ValueError(
+                "Vispy grid rendering requires a 2D domain; use PyVista for 3D grids."
+            )
+        opts = frame.options
+        frame.sharedBounds = getSharedBounds(
+            (
+                frame.fluid.quantities
+                if opts.fluidVisualization == VisualizeOptions.Visualize
+                else None
+            ),
+            (
+                frame.boundary.quantities
+                if opts.boundaryVisualization == VisualizeOptions.Visualize
+                else None
+            ),
+            opts,
+        )
+
+    def close(self):
+        """Release the backend's rendering resources."""
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Capability flags
     # ------------------------------------------------------------------

@@ -44,13 +44,19 @@ class MatplotlibBackend(AbstractBackend):
                 "Install it with:  pip install 'warpSPHPlotting[plot-matplotlib]'"
             ) from exc
 
-        opts = backendOptions or {}
+        opts = dict(backendOptions or {})
+        if not opts.keys() & {"layout", "constrained_layout", "tight_layout"}:
+            opts["layout"] = "constrained"
         self._fig, self._axes = plt.subplot_mosaic(
             mosaic,
             figsize=figsize,
             sharex=sharex,
             sharey=sharey,
-            **{k: v for k, v in opts.items() if k not in ("figsize", "sharex", "sharey")},
+            **{
+                k: v
+                for k, v in opts.items()
+                if k not in ("figsize", "sharex", "sharey")
+            },
         )
         if figTitle is not None:
             self._fig.suptitle(figTitle, fontsize=16)
@@ -70,6 +76,7 @@ class MatplotlibBackend(AbstractBackend):
         domain: Any,
         quantity: Any,
         options: Any,
+        _preparedFrame=None,
     ) -> Any:
         # Late import avoids circular dependency:
         # visualize.py → backends.factory → matplotlib_backend → visualize (here)
@@ -82,6 +89,7 @@ class MatplotlibBackend(AbstractBackend):
             domain=domain,
             quantity=quantity,
             options=options,
+            _preparedFrame=_preparedFrame,
         )
 
     def update_panel(
@@ -111,7 +119,6 @@ class MatplotlibBackend(AbstractBackend):
 
     def show(self) -> None:
         if self._fig is not None:
-            # self._fig.tight_layout()
             self._fig.canvas.draw()
             self._fig.canvas.flush_events()
 
@@ -119,7 +126,10 @@ class MatplotlibBackend(AbstractBackend):
         if self._fig is None:
             return
         self._fig.suptitle("" if title is None else title, fontsize=16)
-        self._fig.canvas.draw_idle()
+        import matplotlib.pyplot as plt
+
+        if plt.isinteractive():
+            self._fig.canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Export
@@ -136,6 +146,13 @@ class MatplotlibBackend(AbstractBackend):
         if self._fig is None:
             raise RuntimeError("No figure to export; call create_figure first.")
         self._fig.savefig(filepath, **kwargs)
+
+    def close(self):
+        import matplotlib.pyplot as plt
+
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = None
 
     # ------------------------------------------------------------------
     # Capability flags

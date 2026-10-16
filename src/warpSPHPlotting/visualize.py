@@ -1,255 +1,40 @@
-from matplotlib.collections import PathCollection
-from matplotlib.colorbar import Colorbar
-from matplotlib.streamplot import StreamplotSet
-from warpSPHCore import *
-from warpSPHPlotting.update import updatePlot
-from .domain import processDomain
-from .grid import generateGrid, mapToGrid, gridVisualize
-from .scatter import scatterVisualize
-from .streamLines import streamLinePlot, updateStreamLinePlot
-from .state import PlottingParticleState, rotateState, filterState
-from .options import PlottingOptions
-from .math import getBounds, buildRotationMatrix, mapQuantity
-from .enumTypes import VisualizeOptions, Mapping, StreamLineLocation
-from typing import Optional, Tuple
-import torch
-import matplotlib.colors as colors
-from matplotlib.collections import PathCollection
-from matplotlib.colorbar import Colorbar
-from .util import verbosePrint
-from .state import VisualizationState, assembleQuantity
+"""Public visualization API and backend-neutral update dispatch."""
+
 import copy
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
+import torch
+from warpSPHCore import DomainDescription
+from .options import PlottingOptions
+from .state import VisualizationState
+from .update import updatePlot
+
 
 def visualizeParticlesNew(
-    fig, axis,
+    fig,
+    axis,
     particleState,
-    domain: DomainDescription,
-    quantity: torch.Tensor,
-    options: PlottingOptions = PlottingOptions(),
-    verbose = False,
-    **kwargs
+    domain,
+    quantity,
+    options=None,
+    verbose=False,
+    _preparedFrame=None,
+    **kwargs,
 ):
-    """
-    High-level visualization orchestrator for SPH particle data.
-    
-    Pipeline: Domain Setup → Quantity Assembly → Rotation → 
-              Operation → Mapping → Filtering → Rendering
-    
-    Args:
-        quantity: Per-particle scalar or per-particle-type tuple of scalars
-        options: Controls all visualization aspects (see PlottingOptions)
-        
-    Returns:
-        VisualizationState with matplotlib artists and intermediate data
-        for use in animations/updates
-    """
-    options = copy.deepcopy(options)
-    for arg in kwargs:
-        if hasattr(options, arg):
-            setattr(options, arg, kwargs[arg])
+    from .backends._render_util import prepare_frame
+    from .update import _renderFrame
 
-    verbosePrint(verbose, "Processing domain and setting up axis...")
-    domain_, rotMat, invRotMat = processDomain(fig, axis, domain, options, (particleState.masses / particleState.densities).mean().item())  
-
-    verbosePrint(verbose, "Assembling quantity for visualization...", "Current quantity: ", quantity.shape if isinstance(quantity, torch.Tensor) else [q.shape if q is not None else None for q in quantity])
-    assembled = assembleQuantity(particleState, quantity)
-    verbosePrint(verbose, "Assembled quantity shape: ", assembled.shape)
-
-    verbosePrint(verbose, "Rotating particle state for filtering...")
-    plotState = PlottingParticleState(
-        positions = particleState.positions,
-        supports = particleState.supports,
-        masses = particleState.masses,
-        densities = particleState.densities,
-        kinds = particleState.kinds,
-        quantities = assembled
-    )
-    # We are rotating the state back to the original orientation for filtering thus we are using the inverse rotation matrix
-    rotatedState = rotateState(plotState, invRotMat)
-    streamLineQuantity = None
-
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.BeforeOperation:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Apply the operation properties to the quantities if specified in the options
-    if options.plottingOperation is not None:
-        if not isinstance(options.plottingOperation, list):
-            operationProperties = [options.plottingOperation]
-        else:
-            operationProperties = options.plottingOperation
-        for o, op in enumerate(operationProperties):
-            verbosePrint(verbose, f"Applying plotting operation {o}...")
-            verbosePrint(verbose, "Quantity shape before plotting operation: ", rotatedState.quantities.shape, 'min: ', torch.min(rotatedState.quantities).item(), 'max: ', torch.max(rotatedState.quantities).item())
-            rotatedState.quantities = warpOperation(
-                queryParticles = rotatedState,
-                queryValues = rotatedState.quantities,
-                operationProperties = op,
-                adjacency = None, # We can consider adding adjacency-based operations in the future
-                domain = domain_
-            )
-            verbosePrint(verbose, "Plotting operation applied. New quantity shape: ", rotatedState.quantities.shape, 'min: ', torch.min(rotatedState.quantities).item(), 'max: ', torch.max(rotatedState.quantities).item())
-
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.BeforeMapping:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Apply mapping to the quantities if specified in the options
-    if options.mapping != Mapping.none:
-        verbosePrint(verbose, f"Applying mapping {options.mapping} to quantities...")
-        verbosePrint(verbose, "Quantity shape before mapping: ", rotatedState.quantities.shape, 'min: ', torch.min(rotatedState.quantities).item(), 'max: ', torch.max(rotatedState.quantities).item())
-        rotatedState.quantities = mapQuantity(rotatedState.quantities, options.mapping)
-        verbosePrint(verbose, "Mapping applied. New quantity shape: ", rotatedState.quantities.shape, 'min: ', torch.min(rotatedState.quantities).item(), 'max: ', torch.max(rotatedState.quantities).item())
-
-    if options.gridVisualization is not None and options.gridVisualization.streamLines and options.gridVisualization.streamLineOperationLocation == StreamLineLocation.AfterMapping:
-        streamLineQuantity = rotatedState.quantities.clone()
-
-    # Checking quantity shape
-    if rotatedState.quantities.shape[0] != rotatedState.positions.shape[0]:
-        raise ValueError(f"Quantity length {rotatedState.quantities.shape[0]} does not match number of particles {rotatedState.positions.shape[0]} after applying plotting operation.")
-    if rotatedState.quantities.ndim == 2:
-        raise ValueError(f"Quantity has more than 1 component per particle (shape: {rotatedState.quantities.shape}). Please specify how to map the quantity to a scalar value for visualization (e.g., using options.mapping) or ensure the plotting operation returns a single scalar value per particle.")
-
-    # Disentangle the different particle types for separate visualization and easier handling of color mapping based on particle type
-    verbosePrint(verbose, "Filtering particle state by type...")
-    fluidParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Fluid) 
-    boundaryParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Boundary)
-    ghostParticles = filterState(rotatedState, rotatedState.quantities, kind=ParticleType.Ghost)
-
-    if options.gridVisualization is None:
-        verbosePrint(verbose, "Creating scatter visualizations for fluid, boundary, and ghost particles...")
-        verbosePrint(verbose, f"Fluid particles: {fluidParticles.positions.shape[0]}, Boundary particles: {boundaryParticles.positions.shape[0]}, Ghost particles: {ghostParticles.positions.shape[0]}")
-        fluidVisualized = options.fluidVisualization == VisualizeOptions.Visualize and fluidParticles.positions.shape[0] > 0
-        boundaryVisualized = options.boundaryVisualization == VisualizeOptions.Visualize and boundaryParticles.positions.shape[0] > 0
-
-        fluidQs = None
-        boundaryQs = None
-        sharedNorm = None
-        if fluidVisualized and boundaryVisualized:
-            combinedQuantity = torch.cat((fluidParticles.quantities, boundaryParticles.quantities), dim=0)
-            combinedQs, sharedNorm = getBounds(combinedQuantity, options)
-            fluidCount = fluidParticles.quantities.shape[0]
-            fluidQs = combinedQs[:fluidCount]
-            boundaryQs = combinedQs[fluidCount:]
-
-        colorBarOnFluid = fluidVisualized
-        colorBarOnBoundary = (not fluidVisualized) and boundaryVisualized
-
-        verbosePrint(verbose, "Plotting Fluid Particles...")
-        fluidSc = scatterVisualize(
-            fig,
-            axis,
-            fluidParticles,
-            domain_,
-            options,
-            variant=options.fluidVisualization,
-            precomputedQs=fluidQs,
-            precomputedNorm=sharedNorm,
-            attachColorBar=colorBarOnFluid,
-        )
-        verbosePrint(verbose, "Plotting Boundary Particles...")
-        boundarySc = scatterVisualize(
-            fig,
-            axis,
-            boundaryParticles,
-            domain_,
-            options,
-            variant=options.boundaryVisualization,
-            precomputedQs=boundaryQs,
-            precomputedNorm=sharedNorm,
-            attachColorBar=colorBarOnBoundary,
-        )
-        verbosePrint(verbose, "Plotting Ghost Particles...")
-        ghostSc = scatterVisualize(fig, axis, ghostParticles, domain_, options, variant=VisualizeOptions.Hide)
-        grid = None
-        streamLines = None
-        gridState = None
-        gridQuantity = None
-    else:
-        gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-            particleState = particleState,
-            quantity = rotatedState.quantities,
-            domain = domain_,
-            nx = options.gridVisualization.resolution,
-            targetNeighbors = 50,
-            kernel = options.plottingKernel,
-            alignment = 'center',
-            includeFluid = options.fluidVisualization != VisualizeOptions.Hide,
-            includeBoundary = options.boundaryVisualization != VisualizeOptions.Hide,
-            gridMode = options.gridVisualization.gridSupport
-        )
-
-        grid = gridVisualize(fig, axis, gridState, gridQuantity, nxs, gridExtent, options)
-        fluidSc, boundarySc, ghostSc = (None, None, None)
-
-        if options.gridVisualization.streamLines:
-            verbosePrint(verbose, "Computing streamlines...")
-            if options.gridVisualization.streamLineOperation is not None:
-                verbosePrint(verbose, "Applying streamline operation to quantity...")
-                streamLineQuantity = warpOperation(
-                    queryParticles = rotatedState,
-                    queryValues = streamLineQuantity,
-                    operationProperties = OperationProperties(
-                        kernel = options.plottingKernel,
-                        operation = options.gridVisualization.streamLineOperation,
-                        gradientMode = options.gridVisualization.streamLineGradientMode,
-                        laplacianMode = options.gridVisualization.streamLineLaplaceMode,  
-                        operationMode = OperationDirection.NoGhost
-                    ),
-                    adjacency = None, # We can consider adding adjacency-based operations in the future
-                    domain = domain_
-                )
-
-            verbosePrint(verbose, "Generating streamlines...")
-            verbosePrint(verbose, "Streamline quantity shape: ", streamLineQuantity.shape)
-            verbosePrint(verbose, "Mapping to Grid for streamlines...")
-
-            streamLineGridState, streamLineGridQuantity, streamLinenxs, streamLineGridExtent = mapToGrid(
-                particleState = particleState,
-                quantity = streamLineQuantity,
-                domain = domain_,
-                nx = options.gridVisualization.resolution,
-                targetNeighbors = 50,
-                kernel = options.plottingKernel,
-                alignment = 'center',
-                includeFluid = options.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary = options.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode = options.gridVisualization.gridSupport
-            )
-            verbosePrint(verbose, 'Mapped streamline quantity to grid. Shape: ', streamLineGridQuantity.shape)
-            verbosePrint(verbose, "Plotting streamlines...")
-
-            streamLines = streamLinePlot(fig, axis, streamLineGridState, streamLineGridQuantity, streamLinenxs, streamLineGridExtent, options)
-        else:
-            streamLines = None
-
-    if options.plotTitle is not None:
-        if options.plotTitleGap is not None:
-            axis.set_title(options.plotTitle, pad=float(options.plotTitleGap))
-        else:
-            axis.set_title(options.plotTitle)
-    verbosePrint(verbose, "Visualization setup complete.")
-    return VisualizationState(
-        fig = fig,
-        axis = axis,
-        domain = domain_,
-        options = options,
-        assembledQuantity = assembled,
-        fluidParticles = fluidParticles,
-        boundaryParticles = boundaryParticles,
-        ghostParticles = ghostParticles,
-        fluidScatterResult = fluidSc,
-        boundaryScatterResult = boundarySc,
-        ghostScatterResult = ghostSc,
-        gridResult = grid,
-        streamLines = streamLines
-    )
-
-
-from typing import Union, Dict, Tuple, Optional, Any, List
-from .state import VisualizationState
-import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
-import copy 
-import time
+    opts = copy.deepcopy(options if options is not None else PlottingOptions())
+    for key, value in kwargs.items():
+        if not hasattr(opts, key):
+            raise TypeError(f"Unknown plotting option: {key}")
+        setattr(opts, key, value)
+    frame = _preparedFrame or prepare_frame(particleState, domain, quantity, opts)
+    state = VisualizationState(fig, axis, frame.domain, frame.options, frame.assembled)
+    result = _renderFrame(state, frame, initial=True)
+    result._sourceDomain = domain
+    return result
 
 
 def _yield_notebook_events(seconds: float = 0.0) -> None:
@@ -269,8 +54,6 @@ def _yield_notebook_events(seconds: float = 0.0) -> None:
         in_notebook = False
 
     if not in_notebook:
-        if delay > 0.0:
-            time.sleep(delay)
         return
 
     try:
@@ -292,10 +75,11 @@ def _yield_notebook_events(seconds: float = 0.0) -> None:
     except Exception:
         if delay > 0.0:
             time.sleep(delay)
-import asyncio
+
+
 @dataclass
 class PlotState:
-    fig: Any  # backend-specific figure handle (matplotlib Figure for default backend)
+    fig: Any  # backend-specific figure handle; inspect backend for the resolved choice
     axes: Dict[str, Any]  # backend-specific per-panel handles
     domain: DomainDescription
     options: PlottingOptions
@@ -312,7 +96,7 @@ class PlotState:
     backendOptions: Optional[dict] = None
     _backend_instance: Any = field(default=None, repr=False, compare=False)
     _update_counter: int = field(default=0, repr=False, compare=False)
-    
+
     def updateTitle(self, newTitle: str):
         self.figTitle = newTitle
         if self._backend_instance is not None:
@@ -323,15 +107,12 @@ class PlotState:
         if hasattr(self.fig, "suptitle"):
             self.fig.suptitle(newTitle, fontsize=16)
 
-    def updateDomain(self, newDomain: DomainDescription):
-        self.domain = newDomain
-        if self._backend_instance is not None:
-            self._backend_instance.update_domain(newDomain)
-            return
+    def updateDomain(self, newDomain):
+        self.updateQuantities(self.quantities, newDomain=newDomain)
 
-        # # Fallback for legacy PlotState objects created without a backend.
-        # for key, panel_state in self.plotStates.items():
-        #     panel_state.domain = newDomain
+    def close(self):
+        if self._backend_instance is not None:
+            self._backend_instance.close()
 
     def show(self) -> None:
         """Display or re-display the figure.
@@ -382,35 +163,105 @@ class PlotState:
             raise RuntimeError("No backend instance available.")
         self._backend_instance.export(filepath, **kwargs)
 
-    def updateQuantities(self, newQuantities: Union[torch.Tensor, Dict[str, torch.Tensor]], key: Optional[str] = None, newParticleState: Optional[Any] = None, newDomain: Optional[DomainDescription] = None, newOptions: Optional[Dict[str, Any]] = None, redraw: bool = True, redrawEvery: int = 1, yieldNotebookEvents: bool = False, yieldSeconds: float = 0.02, **kwargs):
-        if newDomain is not None:
-            self.domain = newDomain
-        if newParticleState is not None or newDomain is not None:
-            self.particleState = copy.deepcopy(newParticleState) if newParticleState is not None else self.particleState
-            
-            positions = self.particleState.positions
-            minD = self.domain.min.detach()
-            maxD = self.domain.max.detach()
-            periodicity = self.domain.periodic
+    def updateQuantities(
+        self,
+        newQuantities: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        key: Optional[str] = None,
+        newParticleState: Optional[Any] = None,
+        newDomain: Optional[DomainDescription] = None,
+        newOptions: Optional[Dict[str, Any]] = None,
+        redraw: bool = True,
+        redrawEvery: int = 1,
+        yieldNotebookEvents: bool = False,
+        yieldSeconds: float = 0.02,
+        resetView: bool = False,
+        **kwargs,
+    ):
+        """Update data, retaining the camera unless its domain changes.
 
-            pos = [(torch.remainder(positions[:, i] - minD[i], maxD[i] - minD[i]) + minD[i]) if periodicity[i] else positions[:,i] for i in range(self.domain.dim)]
-            self.particleState.positions = torch.stack(pos, dim = -1)
-            # modPos = torch.stack(pos, dim = -1).detach().cpu().numpy()
+        Use resetView=True for a new case or a one-off refit. Set the plotting
+        option dynamicBounds=True to follow visible particle bounds each frame.
+        """
+        from .state import snapshotParticleState, snapshotQuantity
 
-        if key is not None and isinstance(newQuantities, dict):
-            self.quantities[key] = newQuantities[key]
-            self.updatePlot(key, newOptions= newOptions[key] if newOptions is not None and key in newOptions else None, **kwargs)
-        elif key is not None and isinstance(newQuantities, torch.Tensor):
-            self.quantities[key] = newQuantities
-            self.updatePlot(key, newOptions= newOptions[key] if newOptions is not None and key in newOptions else None, **kwargs)
-        elif key is None and isinstance(self.quantities, dict) and isinstance(newQuantities, dict):
-            for k in newQuantities:
-                self.quantities[k] = newQuantities[k]
-                self.updatePlot(k, newOptions= newOptions[k] if newOptions is not None and k in newOptions else None, **kwargs)
+        pending_domain = newDomain if newDomain is not None else self.domain
+        pending_particles = (
+            snapshotParticleState(newParticleState)
+            if newParticleState is not None
+            else self.particleState
+        )
+        if key is not None:
+            if key not in self.plotStates:
+                raise KeyError(f"Unknown panel: {key}")
+            replacements = {
+                key: (
+                    newQuantities[key]
+                    if isinstance(newQuantities, dict)
+                    else newQuantities
+                )
+            }
+        elif isinstance(newQuantities, dict):
+            replacements = dict(newQuantities)
         else:
-            if len(self.plotStates) == 1:
-                self.quantities = newQuantities
-                self.updatePlot(list(self.plotStates.keys())[0], newOptions= newOptions[list(self.plotStates.keys())[0]] if newOptions is not None and list(self.plotStates.keys())[0] in newOptions else None, **kwargs)
+            replacements = {k: newQuantities for k in self.plotStates}
+        unknown = replacements.keys() - self.plotStates.keys()
+        if unknown:
+            raise KeyError(f"Unknown panels: {sorted(unknown)}")
+        quantities = {
+            k: (
+                self.quantities[k]
+                if isinstance(self.quantities, dict)
+                else self.quantities
+            )
+            for k in self.plotStates
+        }
+        quantities.update(
+            {key: snapshotQuantity(value) for key, value in replacements.items()}
+        )
+        # Geometry changes affect all panels, even with a partial quantity update.
+        affected = (
+            list(self.plotStates)
+            if newDomain is not None or newParticleState is not None
+            else list(replacements)
+        )
+        from .backends._render_util import prepare_frame
+
+        prepared_options = {}
+        frames = {}
+        spacing_cache = {}
+        for k in affected:
+            opts = copy.deepcopy(self.plotStates[k].options)
+            for name, value in dict((newOptions or {}).get(k, {}), **kwargs).items():
+                if not hasattr(opts, name):
+                    raise TypeError(f"Unknown plotting option: {name}")
+                setattr(opts, name, value)
+            # Validate every requested panel before mutating renderer state.
+            frames[k] = prepare_frame(
+                pending_particles,
+                pending_domain,
+                quantities[k],
+                opts,
+                _spacingCache=spacing_cache,
+            )
+            self._backend_instance.validate_frame(frames[k])
+            frames[k].resetView = resetView
+            prepared_options[k] = opts
+        for k in affected:
+            self.plotStates[k] = self._backend_instance.update_panel(
+                k,
+                self.plotStates[k],
+                particleState=pending_particles,
+                domain=pending_domain,
+                quantity=quantities[k],
+                options=prepared_options[k],
+                _preparedFrame=frames[k],
+            )
+        self.domain, self.particleState, self.quantities = (
+            pending_domain,
+            pending_particles,
+            quantities,
+        )
+        self.options = {key: state.options for key, state in self.plotStates.items()}
 
         # Flush the display after all panels are updated.
         # For pyvista-static this captures a new screenshot; for trame it
@@ -421,14 +272,18 @@ class PlotState:
             if self._update_counter % n == 0:
                 self._backend_instance.show()
 
-        if yieldNotebookEvents or self.backend == 'pyvista':
+        if yieldNotebookEvents or self.backend == "pyvista":
             _yield_notebook_events(yieldSeconds)
         # if self.backend == 'matplotlib':
         #     self.fig.canvas.draw()
         #     self.fig.canvas.flush_events()
 
-
-    def updatePlot(self, key: Union[str, List[str]], newOptions: Optional[Dict[str, Any]] = None, **kwargs):
+    def updatePlot(
+        self,
+        key: Union[str, List[str]],
+        newOptions: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
         if isinstance(key, list):
             for k in key:
                 self.updatePlot(k, newOptions, **kwargs)
@@ -436,7 +291,11 @@ class PlotState:
 
         panel_state = self.plotStates[key]
         particleState = self.particleState
-        quantity = self.quantities[key] if isinstance(self.quantities, dict) else self.quantities
+        quantity = (
+            self.quantities[key]
+            if isinstance(self.quantities, dict)
+            else self.quantities
+        )
 
         if self._backend_instance is not None:
             updatedState = self._backend_instance.update_panel(
@@ -447,7 +306,7 @@ class PlotState:
                 quantity=quantity,
                 options=panel_state.options,
                 **newOptions if newOptions is not None else {},
-                **kwargs
+                **kwargs,
             )
         else:
             # Fallback: direct matplotlib updatePlot (keeps backward-compat if
@@ -459,7 +318,7 @@ class PlotState:
                 quantity=quantity,
                 options=panel_state.options,
                 **newOptions if newOptions is not None else {},
-                **kwargs
+                **kwargs,
             )
         self.plotStates[key] = updatedState
 
@@ -469,26 +328,49 @@ def visualize(
     domain: DomainDescription,
     quantities: Union[torch.Tensor, Dict[str, torch.Tensor]],
     plotOptions: Union[PlottingOptions, Dict[str, PlottingOptions]],
-    mosaic: str = 'A',
+    mosaic: str = "A",
     figsize: Tuple[float, float] = (7, 6),
     sharex: bool = True,
     sharey: bool = True,
     figTitle: Optional[str] = None,
-    backend: str = "matplotlib",
+    backend: str = "auto",
     backendOptions: Optional[dict] = None,
-) -> 'PlotState':
+) -> "PlotState":
     """Create a multi-panel SPH visualization.
 
     Args:
-        backend: One of ``"matplotlib"`` (default), ``"pyvista"``, or
-            ``"vispy"``.  Pass the :class:`~warpSPHPlotting.Backend` enum or a plain
-            string — both work.
+        backend: ``"auto"`` (default) retains Matplotlib for small 2D plots and
+            selects an installed accelerated backend for native 3D or at least
+            50,000 visible scatter particles across panels. Explicit
+            ``"matplotlib"``, ``"pyvista"``, and ``"vispy"`` choices are honored.
+            Enum values are also accepted. Inspect ``PlotState.backend`` for
+            the resolved name; updates retain that backend.
         backendOptions: Optional dict of keyword arguments forwarded verbatim to
             the chosen backend's ``create_figure`` call.
     """
-    from .backends.factory import get_backend
-    be = get_backend(backend, backendOptions)
+    from .backends.factory import get_backend, select_backend
 
+    from .state import snapshotParticleState, snapshotQuantity
+    from .backends._mosaic import parse_mosaic
+    from .backends._render_util import prepare_frame
+
+    visParticleState = snapshotParticleState(particleState)
+    quantities = snapshotQuantity(quantities)
+    _, panel_keys, _ = parse_mosaic(mosaic)
+    frames = {}
+    spacing_cache = {}
+    for key in panel_keys:
+        frames[key] = prepare_frame(
+            visParticleState,
+            domain,
+            quantities[key] if isinstance(quantities, dict) else quantities,
+            plotOptions[key] if isinstance(plotOptions, dict) else plotOptions,
+            _spacingCache=spacing_cache,
+        )
+    backend = select_backend(backend, frames.values(), sharex=sharex, sharey=sharey)
+    be = get_backend(backend, backendOptions)
+    for frame in frames.values():
+        be.validate_frame(frame)
     fig = be.create_figure(
         mosaic=mosaic,
         figsize=figsize,
@@ -499,16 +381,6 @@ def visualize(
     )
     axis = be.get_axes()
 
-    visParticleState = copy.deepcopy(particleState)
-    
-    positions = particleState.positions
-    minD = domain.min.detach()
-    maxD = domain.max.detach()
-    periodicity = domain.periodic
-
-    pos = [(torch.remainder(positions[:, i] - minD[i], maxD[i] - minD[i]) + minD[i]) if periodicity[i] else positions[:,i] for i in range(domain.dim)]
-    visParticleState.positions = torch.stack(pos, dim = -1)
-
     plotStates = {}
     for key in axis:
         panel_state = be.render_panel(
@@ -517,10 +389,11 @@ def visualize(
             domain=domain,
             quantity=quantities[key] if isinstance(quantities, dict) else quantities,
             options=plotOptions[key] if isinstance(plotOptions, dict) else plotOptions,
+            _preparedFrame=frames[key],
         )
         plotStates[key] = panel_state
 
-    if backend == 'matplotlib':
+    if backend == "matplotlib" and fig.get_layout_engine() is None:
         fig.tight_layout()
     be.show()
 
@@ -536,8 +409,7 @@ def visualize(
         figTitle=figTitle,
         plotStates=plotStates,
         particleState=visParticleState,
-        backend=str(backend),
+        backend=str(getattr(backend, "value", backend)).lower(),
         backendOptions=backendOptions,
         _backend_instance=be,
     )
-

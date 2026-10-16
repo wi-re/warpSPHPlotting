@@ -34,16 +34,12 @@ After the initial :func:`~warpSPHPlotting.visualize.visualize` call, call
 in-place via ``set_data`` — no scene teardown — so position and colour
 changes are fast.
 
-Current limitations (Phase 4)
-------------------------------
-- Streamlines are not yet supported (``supports_streamlines = False``).
-- Axis tick-label widgets are not wired (vispy does not replicate
-  matplotlib-style annotated axes).
-- ``sharex`` / ``sharey`` camera linking between panels is not yet wired.
-- No colour-bar widget; the norm/cmap used is the same as the matplotlib
-  backend so scalar ranges are still deterministic.
-- ``matplotlib`` must be installed for the colormap / norm pipeline
-  (same implicit dependency as the pyvista backend).
+Limits and dependencies
+-----------------------
+- Grid rendering and streamline integration use 2D fields or planar 3D slices.
+- Axis labels are shown for 2D views; 3D scenes use a fitted turntable camera.
+- Matplotlib supplies normalization, colormaps, and streamline integration.
+- Image/notebook display requires IPython; EGL requires an available GL runtime.
 """
 
 from __future__ import annotations
@@ -52,7 +48,10 @@ import contextlib
 import io as _io
 import os as _os
 import sys as _sys
+import threading
+from functools import wraps
 import numpy as np
+import torch
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -60,18 +59,19 @@ from .base import AbstractBackend
 from .asyncExport import submitImageWrite
 from ..enumTypes import VisualizeOptions
 from ..options import PlottingOptions
-
+from .._sizing import particle_diameter, explicit_pixel_size
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Panel state dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class VispyVisualizationState:
     """Per-panel rendering state kept by the Vispy backend."""
 
-    canvas: Any                    # shared vispy.scene.SceneCanvas reference
-    view: Any                      # ViewBox for this panel
+    canvas: Any  # shared vispy.scene.SceneCanvas reference
+    view: Any  # ViewBox for this panel
 
     # Marker visuals; None if the particle type is hidden or absent
     markers_fluid: Optional[Any]
@@ -86,7 +86,7 @@ class VispyVisualizationState:
     # ColorBarWidget placed to the right of the view; None if showColorBar=False
     colorbar: Optional[Any]
 
-    domain: Any                    # DomainDescription (detached copy)
+    domain: Any  # DomainDescription (detached copy)
     options: PlottingOptions
 
     # Per-type particle states (for update bookkeeping)
@@ -95,11 +95,15 @@ class VispyVisualizationState:
     ghostParticles: Any
     assembledQuantity: Any
     rotatedQuantities: Any
+    title_visual: Any = None
+    stream_visual: Any = None
+    cached_colorbar: Any = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Private helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _to_3d(positions) -> np.ndarray:
     """Convert (N, 2-or-3) float tensor → (N, 3) float32 numpy array."""
@@ -154,6 +158,7 @@ def _suppress_vispy_init_warnings():
     # ── vispy logger (DPI warning) ───────────────────────────────────────────
     try:
         import vispy.util.logs as _vispy_logs  # noqa: PLC0415
+
         _vispy_logger = _vispy_logs.logger
         _saved_level = _vispy_logger.level
         _vispy_logger.setLevel(_logging.ERROR)
@@ -191,6 +196,7 @@ def _get_cmap(name: str):
             pass
     # Final fallback for very old matplotlib
     import matplotlib.cm as mcm  # noqa: PLC0415
+
     return mcm.get_cmap(name)
 
 
@@ -204,7 +210,16 @@ def _mpl_to_vispy_cmap(cmap_name: str):
 
     mpl_cmap = _get_cmap(cmap_name)
     lut = mpl_cmap(np.linspace(0.0, 1.0, 256)).astype(np.float32)
-    return VispyColormap(lut)
+
+    class PersistentLUTColormap(VispyColormap):
+        def texture_lut(self):
+            # Vispy otherwise allocates a new texture even when only a
+            # colorbar's limits or geometry changed. Our LUT is immutable.
+            if not hasattr(self, "_plotting_texture"):
+                self._plotting_texture = super().texture_lut()
+            return self._plotting_texture
+
+    return PersistentLUTColormap(lut)
 
 
 def _scalars_to_rgba(q_clipped: np.ndarray, norm, cmap_name: str) -> np.ndarray:
@@ -219,11 +234,9 @@ def _scalars_to_rgba(q_clipped: np.ndarray, norm, cmap_name: str) -> np.ndarray:
     rather than ``(N, 1, 4)`` which vispy ``Markers`` cannot interpret
     correctly.
     """
-    q_flat = np.asarray(q_clipped).ravel()  # guarantee 1-D → output is (N, 4)
+    q_flat = np.ma.asarray(q_clipped).ravel()  # guarantee 1-D → output is (N, 4)
     cmap = _get_cmap(cmap_name)
-    normed = norm(q_flat)
-    if hasattr(normed, "data"):   # masked array returned by some norms
-        normed = normed.data
+    normed = np.ma.filled(norm(q_flat), np.nan)
     normed = np.clip(normed, 0.0, 1.0)
     return cmap(normed).astype(np.float32)
 
@@ -232,101 +245,39 @@ def _cmap_name(options: PlottingOptions) -> str:
     return options.colorMap.value + ("_r" if options.flipColorMap else "")
 
 
-_MPL_PTS2_TO_VISPY_PX = 2.0 * (1.0 / np.pi) ** 0.5 * (96.0 / 72.0)
-"""Conversion factor from matplotlib scatter ``s`` (pts²) to vispy pixel diameter.
+def _marker_sizes(options, fluid, boundary, default_pixel_size):
+    if options.markerSize is not None:
+        size = explicit_pixel_size(options.markerSize)
+        return "fixed", size, size
+    if default_pixel_size is not None:
+        return "fixed", default_pixel_size, default_pixel_size
 
-Derivation:
-  diameter_pts = 2 * sqrt(s / π)
-  diameter_px  = diameter_pts * (screen_dpi / 72)  # 96 DPI assumed
-"""
+    def diameter(particles, variant):
+        if options.gridVisualization is not None or variant == VisualizeOptions.Hide:
+            return 0.0
+        return particle_diameter(particles, options)
 
-
-def _point_size(
-    options: PlottingOptions,
-    default_size: float,
-) -> float:
-    """Resolve marker size in vispy pixel diameter.
-
-    When ``options.markerSize`` is ``None``, return *default_size*.
-    When explicitly set, convert from matplotlib scatter area units (pts²) to
-    vispy pixel diameter so that the same ``PlottingOptions.markerSize`` value
-    produces visually comparable results across backends.
-    """
-    if options.markerSize is None:
-        return float(default_size)
-    # matplotlib s = area in pts²; vispy size = diameter in px
-    return max(1.0, float(options.markerSize) ** 0.5 * _MPL_PTS2_TO_VISPY_PX)
-
-
-def _estimate_particle_dx(fluid, boundary) -> float:
-    """`sqrt((masses/densities).mean())` -- the real particle spacing, from
-    whichever population is non-empty (fluid preferred; a boundary-only
-    scene, e.g. a hydrostatic wall-only frame, falls back to boundary).
-    Mirrors `warpSPHPlotting/domain.py`'s matplotlib-path `dx` computation.
-    Returns `None` if neither population has particles, so callers fall back
-    to `_auto_point_size`'s own area/count estimate."""
-    for state in (fluid, boundary):
-        n = int(state.positions.shape[0]) if state is not None else 0
-        if n > 0:
-            vol = (state.masses / state.densities).mean()
-            return float(vol.clamp_min(1e-300) ** 0.5)
-    return None
-
-
-def _auto_point_size(
-    domain_,
-    n_particles: int,
-    panel_w_px: float,
-    panel_h_px: float,
-    particle_dx: float = None,
-) -> float:
-    """Estimate a vispy pixel diameter so each particle covers roughly one cell.
-
-    `particle_dx` (preferred, when available): the case's own real particle
-    spacing, `sqrt((masses/densities).mean())` -- the same quantity
-    `warpSPHPlotting/domain.py`'s matplotlib path threads through to
-    `scatter_util.computeMarkerSize` as its `dx` argument. Use this whenever
-    the caller has it: `n_particles`-over-domain-area is only a valid spacing
-    estimate when particles fill the domain roughly uniformly, which is false
-    for the common case of a large multi-layer boundary/wall band around a
-    much smaller/thinner fluid volume (e.g. a dam-break tank: boundary+ghost
-    particles alone can outnumber fluid particles several-to-one while
-    covering only the perimeter, not the interior) -- dividing area by that
-    inflated `n_particles` under-counts the TRUE areal density and produces
-    markers roughly 2x too large (reported directly against a dam-break run,
-    nx=35). Falls back to the old area/count estimate only when `particle_dx`
-    is not supplied, so a caller without mass/density data still gets a
-    reasonable size instead of an error.
-    """
-    mn = domain_.min.cpu().numpy()
-    mx = domain_.max.cpu().numpy()
-    domain_w = max(float(mx[0] - mn[0]), 1e-9)
-    domain_h = max(float(mx[1] - mn[1]), 1e-9)
-    if particle_dx is not None and particle_dx > 0:
-        dx = float(particle_dx)
-    elif n_particles > 1:
-        # Estimated square-packing spacing -- see docstring for why this is
-        # only a fallback, not the preferred path.
-        dx = (domain_w * domain_h / n_particles) ** 0.5
-    else:
-        dx = domain_w / 32.0
-    # Pixels per domain unit — use the more constrained axis
-    px_per_unit = min(panel_w_px / domain_w, panel_h_px / domain_h)
-    size_px = dx * px_per_unit * 0.8
-    return max(2.0, float(size_px))
+    return (
+        "scene",
+        diameter(fluid, options.fluidVisualization),
+        diameter(boundary, options.boundaryVisualization),
+    )
 
 
 def _domain_line_positions_2d(domain_) -> np.ndarray:
     """Return (5, 3) float32 positions for a closed 2-D bounding-box rectangle."""
     mn = domain_.min.cpu().numpy()
     mx = domain_.max.cpu().numpy()
-    return np.array([
-        [mn[0], mn[1], 0.0],
-        [mx[0], mn[1], 0.0],
-        [mx[0], mx[1], 0.0],
-        [mn[0], mx[1], 0.0],
-        [mn[0], mn[1], 0.0],   # close the loop
-    ], dtype=np.float32)
+    return np.array(
+        [
+            [mn[0], mn[1], 0.0],
+            [mx[0], mn[1], 0.0],
+            [mx[0], mx[1], 0.0],
+            [mn[0], mx[1], 0.0],
+            [mn[0], mn[1], 0.0],  # close the loop
+        ],
+        dtype=np.float32,
+    )
 
 
 def _domain_line_positions_3d(domain_) -> np.ndarray:
@@ -338,23 +289,72 @@ def _domain_line_positions_3d(domain_) -> np.ndarray:
     mx = domain_.max.cpu().numpy()
     x0, y0, z0 = float(mn[0]), float(mn[1]), float(mn[2])
     x1, y1, z1 = float(mx[0]), float(mx[1]), float(mx[2])
-    return np.array([
-        # bottom face
-        [x0, y0, z0], [x1, y0, z0],
-        [x1, y0, z0], [x1, y1, z0],
-        [x1, y1, z0], [x0, y1, z0],
-        [x0, y1, z0], [x0, y0, z0],
-        # top face
-        [x0, y0, z1], [x1, y0, z1],
-        [x1, y0, z1], [x1, y1, z1],
-        [x1, y1, z1], [x0, y1, z1],
-        [x0, y1, z1], [x0, y0, z1],
-        # verticals
-        [x0, y0, z0], [x0, y0, z1],
-        [x1, y0, z0], [x1, y0, z1],
-        [x1, y1, z0], [x1, y1, z1],
-        [x0, y1, z0], [x0, y1, z1],
-    ], dtype=np.float32)
+    return np.array(
+        [
+            # bottom face
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z0],
+            # top face
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+            [x0, y1, z1],
+            [x0, y0, z1],
+            # verticals
+            [x0, y0, z0],
+            [x0, y0, z1],
+            [x1, y0, z0],
+            [x1, y0, z1],
+            [x1, y1, z0],
+            [x1, y1, z1],
+            [x0, y1, z0],
+            [x0, y1, z1],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _turntable_camera(domain):
+    from vispy.scene.cameras import TurntableCamera
+
+    class DomainTurntableCamera(TurntableCamera):
+        _plot_bounds = None
+
+        def _update_projection_transform(self, fx, fy):
+            bounds = self._plot_bounds
+            if bounds is not None:
+                if self.fov == 0:
+                    mn, mx = bounds
+                    # Vispy's default ortho range is +/- 1e6 world units.
+                    # Small domains then lose depth precision on NVIDIA and
+                    # overlapping particles render according to input order.
+                    # Follow the domain, camera translation, and orbit distance.
+                    self._depth_value = max(
+                        float(
+                            2 * np.linalg.norm(mx - mn)
+                            + np.linalg.norm(np.asarray(self.center) - (mn + mx) / 2)
+                            + abs(self.distance or 0)
+                        ),
+                        np.finfo(np.float32).tiny,
+                    )
+                else:
+                    # For perspective, this property is a near/far ratio.
+                    self._depth_value = 1_000
+            return super()._update_projection_transform(fx, fy)
+
+    camera = DomainTurntableCamera()
+    # Camera interactions must not synchronize a running CUDA simulation.
+    camera._plot_bounds = (domain.min.cpu().numpy(), domain.max.cpu().numpy())
+    return camera
 
 
 def _fit_camera_to_domain(view: Any, domain_, margin: float = 0.05) -> None:
@@ -387,8 +387,14 @@ def _fit_camera_to_domain(view: Any, domain_, margin: float = 0.05) -> None:
             # rejects a particular range on first layout/resize pass.
             eps = 0.5
             view.camera.set_range(x=(cx - eps, cx + eps), y=(cy - eps, cy + eps))
-    # For 3-D, allow vispy's default auto-fit; an explicit extent-based fit
-    # is deferred as a Phase 4 follow-up.
+    else:
+        view.camera._plot_bounds = (mn, mx)
+        view.camera.set_range(
+            x=(float(mn[0]), float(mx[0])),
+            y=(float(mn[1]), float(mx[1])),
+            z=(float(mn[2]), float(mx[2])),
+            margin=margin,
+        )
 
 
 def _view_rect_is_degenerate(view: Any, eps: float = 1e-9) -> bool:
@@ -437,16 +443,14 @@ def _grid_to_rgba_image(
     x-index — the correct layout for a vispy ``Image`` visual whose column
     axis is x and row axis is y.
     """
-    from ..math import getBounds  # noqa: PLC0415
+    from ..grid import gridDisplayBounds
 
-    qs, norm = getBounds(gridQuantity, opts)
+    qs, norm = gridDisplayBounds(gridQuantity, gridExtent, opts)
     nx, ny = nxs[0], nxs[1]
 
     # Reshape: ij-order (nx, ny) → transpose → (ny, nx) = (H, W)
     q_img = qs.reshape(nx, ny).T
-    normed = norm(q_img)
-    if hasattr(normed, "data"):
-        normed = normed.data
+    normed = np.ma.filled(norm(q_img) if norm is not None else q_img, np.nan)
     normed = np.clip(normed, 0.0, 1.0)
     rgba_img = _get_cmap(cmap_name)(normed).astype(np.float32)  # (H, W, 4)
 
@@ -480,69 +484,119 @@ def _image_transform(ox: float, oy: float, dx: float, dy: float):
     return STTransform(scale=(dx, dy), translate=(ox, oy))
 
 
-def _style_colorbar_tick_labels(colorbar_widget: Any) -> None:
-    """Apply custom tick styling for vispy ColorBarWidget.
+def _release_current_gl_context(canvas):
+    """Release offscreen contexts after readback or notebook frame delivery.
 
-    For vertical colorbars (orientation right/left), rotate ticks to read
-    vertically and mirror the anchors so the upper-limit tick is right-
-    aligned and the lower-limit tick is left-aligned.
+    Vispy's EGL backend destroys a surface on close without unbinding its
+    context. NVIDIA can then reject VTK's GLXMakeCurrent with BadAccess.
+    Notebook GLFW contexts also need releasing before a different kernel
+    thread can render a widget callback or export.
+    Do not destroy shared contexts or terminate the application display.
     """
-    if colorbar_widget is None:
+    name = canvas.app.backend_name.lower()
+    if name == "jupyter_rfb":
+        # Notebook execution and widget callbacks can run on different kernel
+        # threads. GLFW cannot bind a context still current on another thread.
+        context = canvas._backend._context
+        if context.glfw:
+            context.glfw.make_context_current(None)
         return
-    try:
-        cb = colorbar_widget._colorbar
-        ticks = cb._ticks
-        if cb.orientation in ("right", "left") and len(ticks) >= 2:
-            ticks[0].rotation = -90
-            ticks[1].rotation = -90
-            ticks[1].pos = (float(ticks[0].pos[0]), float(ticks[0].pos[1]))
-
-            # Vispy recomputes tick positions during layout; choose top/bottom
-            # by y-position and set mirrored horizontal anchors.
-            y0 = float(ticks[0].pos[1])
-            y1 = float(ticks[1].pos[1])
-            top_idx = 0 if y0 >= y1 else 1
-            bottom_idx = 1 - top_idx
-
-            # Use vertical top/bottom anchors so rotated labels are nudged
-            # inward from the colorbar ends instead of straddling the limits.
-            # ticks[top_idx].anchors = ("right", "top")
-            # ticks[bottom_idx].anchors = ("left", "bottom")
-
-            # Anchors alone are not always sufficient in vispy; explicitly
-            # move labels inward by a few pixels for consistent placement.
-            # inward_px = 160.0
-            # top_pos = np.array(ticks[top_idx].pos, dtype=np.float32)
-            # bot_pos = np.array(ticks[bottom_idx].pos, dtype=np.float32)
-            # top_pos[1] -= inward_px
-            # bot_pos[1] += inward_px
-            # ticks[top_idx].pos = top_pos
-            # ticks[bottom_idx].pos = bot_pos
-
-            # Ensure the text visuals pick up the modified transforms.
-            # ticks[top_idx].update()
-            # ticks[bottom_idx].update()
-            cb.update()
-    except Exception:
-        # Styling is best-effort; skip if vispy internals differ.
-        pass
-
-
-def _install_colorbar_style_hook(colorbar_widget: Any) -> None:
-    """Install a post-resize hook so custom tick alignment persists."""
-    if colorbar_widget is None or getattr(colorbar_widget, "_warpSPHPlotting_style_hook", False):
+    if name != "egl":
         return
-    try:
-        original_on_resize = colorbar_widget.on_resize
+    from vispy.app.backends import _egl
 
-        def _on_resize_and_style(event):
-            original_on_resize(event)
-            _style_colorbar_tick_labels(colorbar_widget)
+    egl = _egl.egl
+    egl.eglMakeCurrent(
+        _egl._EGL_DISPLAY, egl.EGL_NO_SURFACE, egl.EGL_NO_SURFACE, egl.EGL_NO_CONTEXT
+    )
 
-        colorbar_widget.on_resize = _on_resize_and_style
-        colorbar_widget._warpSPHPlotting_style_hook = True
-    except Exception:
-        pass
+
+class _CanvasAccess:
+    """Keep widget draws, scene mutations and framebuffer access on one path."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.local = threading.local()
+        self.drawing = False
+        self.closed = False
+        self.redraw_pending = False
+        self.schedule_redraw = None
+
+    @contextlib.contextmanager
+    def use(self, canvas):
+        with self.lock:
+            depth = getattr(self.local, "depth", 0)
+            self.local.depth = depth + 1
+            try:
+                if depth == 0 and canvas is not None and not self.closed:
+                    canvas.set_current()
+                yield
+            finally:
+                self.local.depth = depth
+                if depth == 0 and canvas is not None:
+                    _release_current_gl_context(canvas)
+                    if self.redraw_pending and not self.closed:
+                        self.redraw_pending = False
+                        if self.schedule_redraw is not None:
+                            self.schedule_redraw()
+
+
+def _serialized_canvas(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._canvas_access.use(self._canvas):
+            return method(self, *args, **kwargs)
+
+    return call
+
+
+def _position_image(image, ox, oy, dx, dy):
+    """Keep the scene/shader transform graph when only pixels change."""
+    from vispy.visuals.transforms import STTransform
+
+    if isinstance(image.transform, STTransform):
+        # STTransform suppresses events when these values are unchanged.
+        image.transform.scale = (dx, dy)
+        image.transform.translate = (ox, oy)
+    else:
+        image.transform = _image_transform(ox, oy, dx, dy)
+
+
+def _style_colorbar_tick_labels(widget: Any) -> None:
+    """Keep physical endpoint labels upright and beside the vertical strip."""
+    cb = widget._colorbar
+    x, y = cb.pos
+    half_width, half_height = cb._halfdim
+    for tick, ty in zip(cb._ticks, (y + half_height, y - half_height)):
+        tick.rotation = 0
+        tick.font_size = 9
+        tick.anchors = ("left", "center")
+        tick.pos = (x + half_width + 5, ty)
+    # Include the longest number in the widget's allocation, rather than
+    # rotating numbers to squeeze them into a fixed narrow column.
+    width = max(80, 34 + 7 * max(len(str(v)) for v in cb.clim))
+    if widget.width_min != width:
+        widget.width_min = widget.width_max = width
+
+
+def _make_colorbar(cmap, limits):
+    from vispy.scene.widgets.colorbar import ColorBarWidget
+
+    class UprightColorBarWidget(ColorBarWidget):
+        def _update_colorbar(self):
+            height = max(1, self.rect.height)
+            # The widget follows the view directly: 12 px gap, 14 px strip.
+            self._colorbar.pos = (19, height / 2)
+            self._colorbar.size = (max(14, height * 0.8), 14)
+            _style_colorbar_tick_labels(self)
+
+    return UprightColorBarWidget(
+        cmap=_mpl_to_vispy_cmap(cmap),
+        orientation="right",
+        label="",
+        label_color="black",
+        clim=tuple(f"{v:.6g}" for v in limits),
+    )
 
 
 def _in_ipykernel() -> bool:
@@ -566,12 +620,17 @@ def _sharedMarkerBounds(fluid, boundary, opts):
     from ..math import getSharedBounds  # noqa: PLC0415
 
     coloured = (VisualizeOptions.Hide, VisualizeOptions.Passive)
-    fluidQuantities = (fluid.quantities
-                       if opts.fluidVisualization not in coloured
-                       and fluid.positions.shape[0] > 0 else None)
-    boundaryQuantities = (boundary.quantities
-                          if opts.boundaryVisualization not in coloured
-                          and boundary.positions.shape[0] > 0 else None)
+    fluidQuantities = (
+        fluid.quantities
+        if opts.fluidVisualization not in coloured and fluid.positions.shape[0] > 0
+        else None
+    )
+    boundaryQuantities = (
+        boundary.quantities
+        if opts.boundaryVisualization not in coloured
+        and boundary.positions.shape[0] > 0
+        else None
+    )
     return getSharedBounds(fluidQuantities, boundaryQuantities, opts)
 
 
@@ -583,14 +642,17 @@ def _no_display_available() -> bool:
     Non-Linux platforms are left alone: macOS/Windows native windowing
     doesn't depend on `DISPLAY`, and EGL is a Linux-specific escape hatch.
     """
-    return (_sys.platform.startswith("linux")
-            and not _os.environ.get("DISPLAY")
-            and not _os.environ.get("WAYLAND_DISPLAY"))
+    return (
+        _sys.platform.startswith("linux")
+        and not _os.environ.get("DISPLAY")
+        and not _os.environ.get("WAYLAND_DISPLAY")
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Backend implementation
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class VispyBackend(AbstractBackend):
     """Vispy / OpenGL rendering backend (Phase 4).
@@ -605,11 +667,12 @@ class VispyBackend(AbstractBackend):
     """
 
     def __init__(self) -> None:
+        self._canvas_access = _CanvasAccess()
         self._canvas: Any = None
-        self._grid_widget: Any = None       # top-level vispy Grid
+        self._grid_widget: Any = None  # top-level vispy Grid
         self._subgrids: Dict[str, Any] = {}  # label → per-panel sub-Grid
         self._axes: Dict[str, Tuple[int, int]] = {}
-        self._views: Dict[str, Any] = {}    # label → ViewBox (inside sub-grid col 0)
+        self._views: Dict[str, Any] = {}  # label → ViewBox
         self._figure_title_widget: Any = None
         self._figure_title_height_px: int = 36
         self._figure_title: str = ""
@@ -618,10 +681,12 @@ class VispyBackend(AbstractBackend):
         self._image_display_handle: Any = None
         self._window_pos: Optional[Tuple[int, int]] = None
         self._force_primary_window: bool = False
-        self._point_size: float = 10.0
+        self._point_size: Optional[float] = None
         self._shown: bool = False
         self._canvas_size: Tuple[int, int] = (960, 480)  # (px_w, px_h)
-        self._shape: Tuple[int, int] = (1, 1)            # (nrows, ncols)
+        self._states = {}
+        self._sharex = self._sharey = False
+        self._shape: Tuple[int, int] = (1, 1)  # (nrows, ncols)
 
     # -------------------------------------------------------------------------
     # Figure management
@@ -657,8 +722,11 @@ class VispyBackend(AbstractBackend):
         # headless EGL/OSMesa context gets selected instead of whatever GUI
         # toolkit vispy would otherwise probe for.
         self._app_backend = opts.get("app_backend", None)
-        if (self._app_backend is None and self._jupyter_mode in ("native", "image")
-                and _no_display_available()):
+        if (
+            self._app_backend is None
+            and self._jupyter_mode in ("native", "image")
+            and _no_display_available()
+        ):
             # vispy's backend choice is a one-shot, process-global decision:
             # the *first* canvas it ever creates locks it in, even if that
             # backend then fails to initialise (`RuntimeError: Can only
@@ -683,11 +751,14 @@ class VispyBackend(AbstractBackend):
             self._window_pos = None
         self._force_primary_window = bool(opts.get("force_primary_window", False))
 
-        self._point_size = float(opts.get("point_size", 10.0))
+        self._point_size = float(opts["point_size"]) if "point_size" in opts else None
         self._shown = False
         self._figure_title = figTitle or ""
 
-        shape, label_to_pos = _parse_mosaic(mosaic)
+        from ._mosaic import parse_mosaic
+
+        shape, label_to_pos, spans = parse_mosaic(mosaic)
+        self._sharex, self._sharey = sharex, sharey
         self._axes = label_to_pos
         self._shape = shape
 
@@ -695,14 +766,80 @@ class VispyBackend(AbstractBackend):
         px_h = int(figsize[1] * 96)
         self._canvas_size = (px_w, px_h)
 
+        access = self._canvas_access
+
+        class PlottingCanvas(vs.SceneCanvas):
+            def render(self, *args, **kwargs):
+                # EGL's programmatic resize changes the surface without a
+                # resize event. Update widgets/transforms before readback.
+                with access.use(self):
+                    if access.closed:
+                        raise RuntimeError("Cannot render a closed Vispy canvas.")
+                    if access.drawing:
+                        raise RuntimeError(
+                            "Export the Vispy canvas after its draw callback returns."
+                        )
+                    access.drawing = True
+                    try:
+                        if tuple(self.central_widget.size) != tuple(self.size):
+                            self.events.resize(
+                                size=self.size, physical_size=self.physical_size
+                            )
+                        return super().render(*args, **kwargs)
+                    finally:
+                        access.drawing = False
+
         with _suppress_vispy_init_warnings():
-            self._canvas = vs.SceneCanvas(
+            self._canvas = PlottingCanvas(
                 title=figTitle or "warpSPHPlotting",
                 size=(px_w, px_h),
                 keys="interactive",
                 show=False,
                 bgcolor="white",
             )
+
+        if self._canvas.app.backend_name.lower() == "jupyter_rfb":
+            # Include asynchronous browser-triggered draws, which bypass
+            # PlottingCanvas.render() and our synchronous show() path.
+            canvas = self._canvas
+            backend = canvas._backend
+            get_frame = backend.get_frame
+
+            def released_frame():
+                with access.use(canvas):
+                    if access.closed:
+                        return None
+                    if access.drawing:
+                        # A draw callback may request show() synchronously.
+                        # Queue another frame instead of re-entering events.draw.
+                        access.redraw_pending = True
+                        return None
+                    access.drawing = True
+                    try:
+                        return get_frame()
+                    finally:
+                        access.drawing = False
+
+            backend.get_frame = released_frame
+
+            def schedule_redraw():
+                if not backend._loop.is_closed():
+                    backend._loop.call_soon_threadsafe(backend.request_draw)
+
+            access.schedule_redraw = schedule_redraw
+
+            def protected_event(method):
+                @wraps(method)
+                def call(*args, **kwargs):
+                    with access.use(canvas):
+                        if not access.closed:
+                            return method(*args, **kwargs)
+
+                return call
+
+            backend.handle_event = protected_event(backend.handle_event)
+            backend._emit_resize_event = protected_event(backend._emit_resize_event)
+            _release_current_gl_context(self._canvas)
 
         self._grid_widget = self._canvas.central_widget.add_grid(spacing=2)
 
@@ -723,13 +860,51 @@ class VispyBackend(AbstractBackend):
 
         self._views = {}
         self._subgrids = {}
+        self._panel_titles = {}
         for label, (r, c) in label_to_pos.items():
             # Each mosaic panel gets a sub-grid so the colorbar column is
-            # fully contained within the panel's allocated space.  Within the
-            # sub-grid: col 0 = ViewBox, col 1 = ColorBarWidget slot (added
-            # lazily in render_panel when showColorBar is True).
-            sg = self._grid_widget.add_grid(row=r + 1, col=c, spacing=0)
-            view = sg.add_view(row=0, col=0, bgcolor="white", border_color="gray")
+            # contained within the panel's allocated space. Columns hold the
+            # y axis, view, and optional colorbar; a title row stays above them.
+            r0, c0, r1, c1 = spans[label]
+            sg = self._grid_widget.add_grid(
+                row=r + 1, col=c, row_span=r1 - r0 + 1, col_span=c1 - c0 + 1, spacing=0
+            )
+            title = Label("", color="black", font_size=10)
+            title.height_min = title.height_max = 0
+            sg.add_widget(title, row=0, col=1)
+            self._panel_titles[label] = title
+            view = sg.add_view(row=1, col=1, bgcolor="white", border_color="gray")
+            from vispy.scene.widgets import AxisWidget
+
+            yaxis = AxisWidget(
+                orientation="left",
+                axis_label="Y",
+                text_color="black",
+                axis_color="black",
+                tick_color="black",
+                font_size=8,
+                axis_width=1,
+                tick_width=1,
+                major_tick_length=5,
+                minor_tick_length=2,
+            )
+            yaxis.width_max = 45
+            xaxis = AxisWidget(
+                orientation="bottom",
+                axis_label="X",
+                text_color="black",
+                axis_color="black",
+                tick_color="black",
+                font_size=8,
+                axis_width=1,
+                tick_width=1,
+                major_tick_length=5,
+                minor_tick_length=2,
+            )
+            xaxis.height_max = 45
+            sg.add_widget(yaxis, row=1, col=0)
+            sg.add_widget(xaxis, row=2, col=1)
+            self.__dict__.setdefault("_axisWidgets", {})[label] = (xaxis, yaxis)
             self._subgrids[label] = sg
             self._views[label] = view
 
@@ -742,6 +917,7 @@ class VispyBackend(AbstractBackend):
     # Per-panel rendering
     # -------------------------------------------------------------------------
 
+    @_serialized_canvas
     def render_panel(
         self,
         panel_key: str,
@@ -749,56 +925,52 @@ class VispyBackend(AbstractBackend):
         domain: Any,
         quantity: Any,
         options: PlottingOptions,
+        _preparedFrame=None,
     ) -> VispyVisualizationState:
         import vispy.scene.visuals as visuals  # noqa: PLC0415
 
-        from ._render_util import prepare_particle_states  # noqa: PLC0415
-        from ..math import getBounds  # noqa: PLC0415
+        from ._render_util import prepare_frame  # noqa: PLC0415
 
         view = self._views[panel_key]
 
         # ── preprocessing ────────────────────────────────────────────────────
-        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = prepare_particle_states(
+        frame = _preparedFrame or prepare_frame(
             particleState, domain, quantity, options
         )
+        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = (
+            frame.domain,
+            frame.options,
+            frame.assembled,
+            frame.particles.quantities,
+            frame.fluid,
+            frame.boundary,
+            frame.ghost,
+        )
+        if opts.gridVisualization is not None and domain_.dim != 2:
+            raise ValueError(
+                "Vispy grid rendering currently requires a 2D domain; use PyVista for 3D grids."
+            )
 
         cmap = _cmap_name(opts)
 
-        # ── auto marker size ──────────────────────────────────────────────────
-        nrows, ncols = self._shape
-        pw, ph = self._canvas_size
-        # Approximate panel pixel size (colorbars take ~65 px per column)
-        cb_px = 65 if opts.showColorBar else 0
-        panel_w_px = max(1.0, pw / max(ncols, 1) - cb_px)
-        panel_h_px = max(1.0, ph / max(nrows, 1))
-        n_total = int(fluid.positions.shape[0]) + int(boundary.positions.shape[0])
-        if opts.markerSize is None:
-            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px,
-                                          particle_dx=_estimate_particle_dx(fluid, boundary))
-        else:
-            point_size = _point_size(opts, self._point_size)
+        marker_scaling, fluid_size, boundary_size = _marker_sizes(
+            opts, fluid, boundary, self._point_size
+        )
 
         # ── camera ────────────────────────────────────────────────────────────
-        view.camera = "panzoom" if domain_.dim == 2 else "turntable"
+        view.camera = "panzoom" if domain_.dim == 2 else _turntable_camera(domain_)
         if domain_.dim == 2:
             view.camera.aspect = 1.0  # enforce equal x/y scale
 
+        for i, axis_widget in enumerate(self._axisWidgets[panel_key]):
+            axis_widget.visible = domain_.dim == 2
+            if domain_.dim == 2:
+                axis_widget.axis.axis_label = "XYZ"[(frame.displayAxes or [0, 1])[i]]
+                axis_widget.link_view(view)
         # ── panel title ───────────────────────────────────────────────────────
-        if opts.plotTitle is not None:
-            mn = domain_.min.cpu().numpy()
-            mx = domain_.max.cpu().numpy()
-            cx = 0.5 * (float(mn[0]) + float(mx[0]))
-            pad_frac = 0.04 if opts.plotTitleGap is None else float(opts.plotTitleGap)
-            pad = (float(mx[1]) - float(mn[1])) * pad_frac
-            visuals.Text(
-                opts.plotTitle,
-                color="black",
-                font_size=10,
-                pos=(cx, float(mx[1]) + pad, 0.0),
-                anchor_x="center",
-                anchor_y="bottom",
-                parent=view.scene,
-            )
+        title_visual = self._panel_titles[panel_key]
+        title_visual.text = opts.plotTitle or ""
+        title_visual.height_min = title_visual.height_max = 26 if opts.plotTitle else 0
 
         # ── domain bounding box ────────────────────────────────────────────────
         domain_lines = None
@@ -813,6 +985,9 @@ class VispyBackend(AbstractBackend):
                 domain_lines = visuals.Line(
                     line_pts, color="blue", connect="segments", parent=view.scene
                 )
+            domain_lines.order = 20
+            if domain_.dim == 2:
+                domain_lines.set_gl_state("translucent", depth_test=False)
 
         # ── grid or scatter path ───────────────────────────────────────────────
         markers_fluid, markers_boundary, image_grid = None, None, None
@@ -822,35 +997,30 @@ class VispyBackend(AbstractBackend):
 
         if opts.gridVisualization is not None:
             # ── grid (Image visual) ───────────────────────────────────────────
-            from ..grid import mapToGrid  # noqa: PLC0415
+            from ..grid import mapFrameToGrid, gridDisplayBounds  # noqa: PLC0415
 
-            gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-                particleState=particleState,
-                quantity=rotated_q,
-                domain=domain_,
-                nx=opts.gridVisualization.resolution,
-                targetNeighbors=50,
-                kernel=opts.plottingKernel,
-                alignment="center",
-                includeFluid=opts.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary=opts.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode=opts.gridVisualization.gridSupport,
-            )
+            gridState, gridQuantity, nxs, gridExtent = mapFrameToGrid(frame, rotated_q)
 
             rgba_img, (ox, oy, dx, dy) = _grid_to_rgba_image(
                 gridState, gridQuantity, nxs, gridExtent, opts, cmap
             )
             image_grid = visuals.Image(rgba_img, parent=view.scene)
-            image_grid.transform = _image_transform(ox, oy, dx, dy)
+            image_grid.set_gl_state("translucent", depth_test=False)
+            _position_image(image_grid, ox, oy, dx, dy)
 
         else:
             # One norm across fluid AND boundary -- see `math.getSharedBounds`.
             # Normalising them separately and drawing both through the same
             # colormap makes wall colours incomparable to fluid colours.
-            fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
+            fluidQs, boundaryQs, sharedNorm = frame.sharedBounds or _sharedMarkerBounds(
+                fluid, boundary, opts
+            )
 
             # ── fluid markers ─────────────────────────────────────────────────
-            if opts.fluidVisualization != VisualizeOptions.Hide and fluid.positions.shape[0] > 0:
+            if (
+                opts.fluidVisualization != VisualizeOptions.Hide
+                and fluid.positions.shape[0] > 0
+            ):
                 pts = _to_3d(fluid.positions)
                 if opts.fluidVisualization == VisualizeOptions.Passive:
                     face_color = np.tile(
@@ -859,16 +1029,20 @@ class VispyBackend(AbstractBackend):
                 else:
                     face_color = _scalars_to_rgba(fluidQs, sharedNorm, cmap)
                 markers_fluid = visuals.Markers(antialias=0, parent=view.scene)
+                markers_fluid.scaling = marker_scaling
                 markers_fluid.set_data(
                     pts,
                     face_color=face_color,
                     edge_color=face_color,
-                    size=point_size,
+                    size=fluid_size,
                     edge_width=0,
                 )
 
             # ── boundary markers ──────────────────────────────────────────────
-            if opts.boundaryVisualization != VisualizeOptions.Hide and boundary.positions.shape[0] > 0:
+            if (
+                opts.boundaryVisualization != VisualizeOptions.Hide
+                and boundary.positions.shape[0] > 0
+            ):
                 pts = _to_3d(boundary.positions)
                 if opts.boundaryVisualization == VisualizeOptions.Passive:
                     face_color = np.tile(
@@ -877,25 +1051,25 @@ class VispyBackend(AbstractBackend):
                 else:
                     face_color = _scalars_to_rgba(boundaryQs, sharedNorm, cmap)
                 markers_boundary = visuals.Markers(antialias=0, parent=view.scene)
+                markers_boundary.scaling = marker_scaling
                 markers_boundary.set_data(
                     pts,
                     face_color=face_color,
                     edge_color=face_color,
-                    size=point_size,
+                    size=boundary_size,
                     edge_width=0,
                 )
 
         # ── camera fit ────────────────────────────────────────────────────────
-        _fit_camera_to_domain(view, domain_)
+        from ._render_util import view_domain
+
+        _fit_camera_to_domain(view, view_domain(frame), margin=opts.domainEpsilon)
 
         # ── colorbar ──────────────────────────────────────────────────────────
         colorbar_widget = None
         if opts.showColorBar:
-            from vispy.scene.widgets.colorbar import ColorBarWidget  # noqa: PLC0415
-
             # Determine which scalar range and cmap to use for the colorbar.
             # Prefer the fluid (active) range; fall back to grid range.
-            from ..math import getBounds  # noqa: PLC0415
 
             cb_range: Optional[Tuple[float, float]] = None
             cb_cmap = cmap
@@ -904,37 +1078,22 @@ class VispyBackend(AbstractBackend):
                 # always reflects the actual data limits, not the normalised
                 # [0, 1] interval.
                 if image_grid is not None:
-                    _, grid_norm = getBounds(gridQuantity, opts)
-                    cb_range = (float(grid_norm.vmin), float(grid_norm.vmax))
+                    _, grid_norm = gridDisplayBounds(gridQuantity, gridExtent, opts)
+                    cb_range = (
+                        (float(grid_norm.vmin), float(grid_norm.vmax))
+                        if grid_norm is not None
+                        else None
+                    )
             elif sharedNorm is not None:
                 # The same norm both marker sets were coloured with, so the bar
                 # describes every particle on screen rather than just the fluid.
                 cb_range = (float(sharedNorm.vmin), float(sharedNorm.vmax))
 
             if cb_range is not None:
-                vmin, vmax = cb_range
-                colorbar_widget = ColorBarWidget(
-                    cmap=_mpl_to_vispy_cmap(cb_cmap),
-                    orientation="right",
-                    label="",
-                    label_color="black",
-                    clim=(f"{vmin:.6g}", f"{vmax:.6g}"),
-                    # padding = (0.5,0)
-                )
-                # Add colorbar into the panel's sub-grid at col 1.
-                # Fix its width so the view (col 0) gets all remaining space.
-                self._subgrids[panel_key].add_widget(colorbar_widget, row=0, col=1)
-                colorbar_widget.width_min = 65
-                colorbar_widget.width_max = 65
-                _install_colorbar_style_hook(colorbar_widget)
-                # Rotate tick labels so they read vertically (-90° CCW, same
-                # as the main colorbar label).  Horizontal numbers like
-                # "0.0123" are wider than the 65-px column; rotated they fit
-                # comfortably.
-                _style_colorbar_tick_labels(colorbar_widget)
-                colorbar_widget.update()
+                colorbar_widget = _make_colorbar(cb_cmap, cb_range)
+                self._subgrids[panel_key].add_widget(colorbar_widget, row=1, col=2)
 
-        return VispyVisualizationState(
+        state = VispyVisualizationState(
             canvas=self._canvas,
             view=view,
             markers_fluid=markers_fluid,
@@ -949,8 +1108,19 @@ class VispyBackend(AbstractBackend):
             ghostParticles=ghost,
             assembledQuantity=assembled,
             rotatedQuantities=rotated_q,
+            title_visual=title_visual,
         )
+        state.cameraGroup = (
+            domain_.dim,
+            tuple(frame.displayAxes or range(domain_.dim)),
+        )
+        state.displayAxes = tuple(frame.displayAxes or range(domain_.dim))
+        self._states[panel_key] = state
+        self._link_compatible_cameras()
+        self._update_streamlines(state, frame)
+        return state
 
+    @_serialized_canvas
     def update_panel(
         self,
         panel_key: str,
@@ -964,9 +1134,14 @@ class VispyBackend(AbstractBackend):
         import copy as _copy  # noqa: PLC0415
         import vispy.scene.visuals as visuals  # noqa: PLC0415
 
-        from ._render_util import prepare_particle_states  # noqa: PLC0415
-        from ..math import getBounds  # noqa: PLC0415
+        from ._render_util import (
+            prepare_frame,
+            view_needs_refit,
+            view_domain,
+        )  # noqa: PLC0415
 
+        cached_frame = kwargs.pop("_preparedFrame", None)
+        old_domain = panel_state.domain
         # Apply any option overrides passed as keyword arguments
         if kwargs:
             options = _copy.deepcopy(options)
@@ -974,47 +1149,58 @@ class VispyBackend(AbstractBackend):
                 if hasattr(options, k):
                     setattr(options, k, v)
 
-        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = prepare_particle_states(
-            particleState, domain, quantity, options
+        frame = cached_frame or prepare_frame(particleState, domain, quantity, options)
+        domain_, opts, assembled, rotated_q, fluid, boundary, ghost = (
+            frame.domain,
+            frame.options,
+            frame.assembled,
+            frame.particles.quantities,
+            frame.fluid,
+            frame.boundary,
+            frame.ghost,
         )
+        if opts.gridVisualization is not None and domain_.dim != 2:
+            raise ValueError(
+                "Vispy grid rendering currently requires a 2D domain; use PyVista for 3D grids."
+            )
 
         cmap = _cmap_name(opts)
 
-        # ── auto marker size ──────────────────────────────────────────────────
-        nrows, ncols = self._shape
-        pw, ph = self._canvas_size
-        cb_px = 65 if opts.showColorBar else 0
-        panel_w_px = max(1.0, pw / max(ncols, 1) - cb_px)
-        panel_h_px = max(1.0, ph / max(nrows, 1))
-        n_total = int(fluid.positions.shape[0]) + int(boundary.positions.shape[0])
-        if opts.markerSize is None:
-            point_size = _auto_point_size(domain_, n_total, panel_w_px, panel_h_px,
-                                          particle_dx=_estimate_particle_dx(fluid, boundary))
-        else:
-            point_size = _point_size(opts, self._point_size)
+        marker_scaling, fluid_size, boundary_size = _marker_sizes(
+            opts, fluid, boundary, self._point_size
+        )
 
         view = panel_state.view
+        if old_domain.dim != domain_.dim:
+            self._unlink_camera(view.camera)
+            view.camera = "panzoom" if domain_.dim == 2 else _turntable_camera(domain_)
+            if domain_.dim == 2:
+                view.camera.aspect = 1.0
+        group = (domain_.dim, tuple(frame.displayAxes or range(domain_.dim)))
+        if group != getattr(panel_state, "cameraGroup", None):
+            self._unlink_camera(view.camera)
+            panel_state.cameraGroup = group
+            self._link_compatible_cameras()
+        for i, axis_widget in enumerate(self._axisWidgets[panel_key]):
+            axis_widget.visible = domain_.dim == 2
+            if domain_.dim == 2:
+                label = "XYZ"[(frame.displayAxes or [0, 1])[i]]
+                if axis_widget.axis.axis_label != label:
+                    axis_widget.axis.axis_label = label
+                axis_widget.link_view(view)
 
         # Set on the marker path below; stays None on the grid path, where the
         # colorbar takes its range from the grid norm instead.
         fluidQs = boundaryQs = sharedNorm = None
 
         if opts.gridVisualization is not None:
+            for marker in (panel_state.markers_fluid, panel_state.markers_boundary):
+                if marker is not None:
+                    marker.visible = False
             # ── grid update ────────────────────────────────────────────────────
-            from ..grid import mapToGrid  # noqa: PLC0415
+            from ..grid import mapFrameToGrid, gridDisplayBounds  # noqa: PLC0415
 
-            gridState, gridQuantity, nxs, gridExtent = mapToGrid(
-                particleState=particleState,
-                quantity=rotated_q,
-                domain=domain_,
-                nx=opts.gridVisualization.resolution,
-                targetNeighbors=50,
-                kernel=opts.plottingKernel,
-                alignment="center",
-                includeFluid=opts.fluidVisualization != VisualizeOptions.Hide,
-                includeBoundary=opts.boundaryVisualization != VisualizeOptions.Hide,
-                gridMode=opts.gridVisualization.gridSupport,
-            )
+            gridState, gridQuantity, nxs, gridExtent = mapFrameToGrid(frame, rotated_q)
 
             rgba_img, (ox, oy, dx, dy) = _grid_to_rgba_image(
                 gridState, gridQuantity, nxs, gridExtent, opts, cmap
@@ -1022,16 +1208,27 @@ class VispyBackend(AbstractBackend):
 
             if panel_state.image_grid is not None:
                 panel_state.image_grid.set_data(rgba_img)
+                panel_state.image_grid.visible = True
+                panel_state.image_grid.set_gl_state("translucent", depth_test=False)
+                _position_image(panel_state.image_grid, ox, oy, dx, dy)
             else:
                 panel_state.image_grid = visuals.Image(rgba_img, parent=view.scene)
-                panel_state.image_grid.transform = _image_transform(ox, oy, dx, dy)
+                panel_state.image_grid.set_gl_state("translucent", depth_test=False)
+                _position_image(panel_state.image_grid, ox, oy, dx, dy)
 
         else:
+            if panel_state.image_grid is not None:
+                panel_state.image_grid.visible = False
             # One norm across fluid AND boundary -- see `math.getSharedBounds`.
-            fluidQs, boundaryQs, sharedNorm = _sharedMarkerBounds(fluid, boundary, opts)
+            fluidQs, boundaryQs, sharedNorm = frame.sharedBounds or _sharedMarkerBounds(
+                fluid, boundary, opts
+            )
 
             # ── fluid markers update ───────────────────────────────────────────
-            if opts.fluidVisualization != VisualizeOptions.Hide and fluid.positions.shape[0] > 0:
+            if (
+                opts.fluidVisualization != VisualizeOptions.Hide
+                and fluid.positions.shape[0] > 0
+            ):
                 pts = _to_3d(fluid.positions)
                 if opts.fluidVisualization == VisualizeOptions.Passive:
                     face_color = np.tile(
@@ -1041,27 +1238,35 @@ class VispyBackend(AbstractBackend):
                     face_color = _scalars_to_rgba(fluidQs, sharedNorm, cmap)
 
                 if panel_state.markers_fluid is not None:
+                    panel_state.markers_fluid.visible = True
+                    panel_state.markers_fluid.scaling = marker_scaling
                     panel_state.markers_fluid.set_data(
                         pts,
                         face_color=face_color,
                         edge_color=face_color,
-                        size=point_size,
+                        size=fluid_size,
                         edge_width=0,
                     )
                 else:
-                    panel_state.markers_fluid = visuals.Markers(antialias=0, parent=view.scene)
+                    panel_state.markers_fluid = visuals.Markers(
+                        antialias=0, parent=view.scene
+                    )
+                    panel_state.markers_fluid.scaling = marker_scaling
                     panel_state.markers_fluid.set_data(
                         pts,
                         face_color=face_color,
                         edge_color=face_color,
-                        size=point_size,
+                        size=fluid_size,
                         edge_width=0,
                     )
             elif panel_state.markers_fluid is not None:
                 panel_state.markers_fluid.visible = False
 
             # ── boundary markers update ────────────────────────────────────────
-            if opts.boundaryVisualization != VisualizeOptions.Hide and boundary.positions.shape[0] > 0:
+            if (
+                opts.boundaryVisualization != VisualizeOptions.Hide
+                and boundary.positions.shape[0] > 0
+            ):
                 pts = _to_3d(boundary.positions)
                 if opts.boundaryVisualization == VisualizeOptions.Passive:
                     face_color = np.tile(
@@ -1071,20 +1276,25 @@ class VispyBackend(AbstractBackend):
                     face_color = _scalars_to_rgba(boundaryQs, sharedNorm, cmap)
 
                 if panel_state.markers_boundary is not None:
+                    panel_state.markers_boundary.visible = True
+                    panel_state.markers_boundary.scaling = marker_scaling
                     panel_state.markers_boundary.set_data(
                         pts,
                         face_color=face_color,
                         edge_color=face_color,
-                        size=point_size,
+                        size=boundary_size,
                         edge_width=0,
                     )
                 else:
-                    panel_state.markers_boundary = visuals.Markers(antialias=0, parent=view.scene)
+                    panel_state.markers_boundary = visuals.Markers(
+                        antialias=0, parent=view.scene
+                    )
+                    panel_state.markers_boundary.scaling = marker_scaling
                     panel_state.markers_boundary.set_data(
                         pts,
                         face_color=face_color,
                         edge_color=face_color,
-                        size=point_size,
+                        size=boundary_size,
                         edge_width=0,
                     )
             elif panel_state.markers_boundary is not None:
@@ -1097,69 +1307,82 @@ class VispyBackend(AbstractBackend):
         panel_state.rotatedQuantities = rotated_q
         panel_state.options = opts
 
-        # ── update colorbar clim / cmap ────────────────────────────────────────
-        if panel_state.colorbar is not None and opts.showColorBar:
-            from vispy.color import Colormap as VispyColormap  # noqa: PLC0415
-
-            new_range: Optional[Tuple[float, float]] = None
-            if opts.gridVisualization is not None:
-                # gridQuantity was computed in the grid update block above
-                _, grid_norm = getBounds(gridQuantity, opts)
-                new_range = (float(grid_norm.vmin), float(grid_norm.vmax))
-            elif sharedNorm is not None:
-                # The same norm both marker sets were coloured with, so the bar
-                # describes every particle on screen rather than just the fluid.
-                new_range = (float(sharedNorm.vmin), float(sharedNorm.vmax))
-            if new_range is not None:
-                vmin, vmax = new_range
-                # 6 significant digits, not 3: a density plot sits near 1.0 and
-            # `.3g` renders both ends of [0.997, 1.003] as "1".
-            # Only what changed: a new `cmap` object regenerates the colorbar's
-            # shader and texture, and a new `clim` re-lays out its tick text --
-            # the same picture either way, but at every frame of a video it
-            # was most of the colorbar's cost.
-            # (last-set values per panel on the backend: vispy widgets are
-            # frozen against new attributes)
-            cb = panel_state.colorbar
-            last = self.__dict__.setdefault("_colorbarLast", {}).setdefault(panel_key, {})
-            clim = (f"{vmin:.6g}", f"{vmax:.6g}")
-            restyle = False
-            if last.get("widget") is not cb:
-                last.clear()
-                last["widget"] = cb
-            if last.get("clim") != clim:
-                cb.clim = clim
-                last["clim"] = clim
-                restyle = True
-            if last.get("cmap") != cmap:
-                cb.cmap = _mpl_to_vispy_cmap(cmap)
-                last["cmap"] = cmap
-                restyle = True
-            if restyle:
+        # Update colorbar presence as well as range. All-passive/empty plots
+        # have no scalar norm, so they must not access unassigned limits.
+        new_range = None
+        if opts.gridVisualization is not None:
+            _, grid_norm = gridDisplayBounds(gridQuantity, gridExtent, opts)
+            new_range = (
+                (float(grid_norm.vmin), float(grid_norm.vmax))
+                if grid_norm is not None
+                else None
+            )
+        elif sharedNorm is not None:
+            new_range = (float(sharedNorm.vmin), float(sharedNorm.vmax))
+        cb = panel_state.colorbar
+        if not opts.showColorBar or new_range is None:
+            if cb is not None:
+                self._subgrids[panel_key].remove_widget(cb)
+                cb.parent = None
+                # Text visuals own GL font resources. Keep one widget per
+                # panel rather than allocating new atlases on every reveal.
+                panel_state.cached_colorbar = cb
+                panel_state.colorbar = None
+        else:
+            if cb is None:
+                cb = panel_state.cached_colorbar
+                if cb is None:
+                    cb = _make_colorbar(cmap, new_range)
+                panel_state.cached_colorbar = None
+                self._subgrids[panel_key].add_widget(cb, row=1, col=2)
+                panel_state.colorbar = cb
+            last = self.__dict__.setdefault("_colorbarLast", {}).setdefault(
+                panel_key, {}
+            )
+            signature = (id(cb), new_range, cmap)
+            if last.get("signature") != signature:
+                color_signature = (id(cb), cmap)
+                if last.get("color_signature") != color_signature:
+                    cb.cmap = _mpl_to_vispy_cmap(cmap)
+                    last["color_signature"] = color_signature
+                # Updating limits also binds the LUT: install a changed cmap
+                # first so its texture is visible in this frame, not the next.
+                cb.clim = tuple(f"{v:.6g}" for v in new_range)
                 _style_colorbar_tick_labels(cb)
-
-        # -- update camera to fit new domain
-        _fit_camera_to_domain(view, domain_)
-        # -- update domain bounding box
-        if panel_state.domain_lines is not None and opts.plotDomain:
-            if domain_.dim == 2:
-                line_pts = _domain_line_positions_2d(domain_)
-                panel_state.domain_lines.set_data(line_pts)
+                last["signature"] = signature
+        changed = view_needs_refit(
+            old_domain, frame, getattr(panel_state, "displayAxes", None)
+        )
+        if changed:
+            _fit_camera_to_domain(view, view_domain(frame), margin=opts.domainEpsilon)
+        panel_state.displayAxes = tuple(frame.displayAxes or range(domain_.dim))
+        panel_state.domain = domain_
+        if opts.plotDomain:
+            pts = (
+                _domain_line_positions_2d(domain_)
+                if domain_.dim == 2
+                else _domain_line_positions_3d(domain_)
+            )
+            if panel_state.domain_lines is None:
+                panel_state.domain_lines = visuals.Line(
+                    pts,
+                    color="blue",
+                    connect="strip" if domain_.dim == 2 else "segments",
+                    parent=view.scene,
+                )
             else:
-                line_pts = _domain_line_positions_3d(domain_)
-                panel_state.domain_lines.set_data(line_pts)
-        # -- adjust panel title position if plotTitleGap changed or domain changed
-        if opts.plotTitle is not None:
-            mn = domain_.min.cpu().numpy()
-            mx = domain_.max.cpu().numpy()
-            cx = 0.5 * (float(mn[0]) + float(mx[0]))
-            pad_frac = 0.04 if opts.plotTitleGap is None else float(opts.plotTitleGap)
-            pad = (float(mx[1]) - float(mn[1])) * pad_frac
-            # Find the existing title text visual and update its position
-            for child in view.scene.children:
-                if isinstance(child, visuals.Text) and child.text == opts.plotTitle:
-                    child.pos = (cx, float(mx[1]) + pad, 0.0)
-                    break
+                panel_state.domain_lines.visible = True
+                panel_state.domain_lines.set_data(pts)
+            panel_state.domain_lines.order = 20
+            panel_state.domain_lines.set_gl_state(
+                "translucent", depth_test=domain_.dim == 3
+            )
+        elif panel_state.domain_lines is not None:
+            panel_state.domain_lines.visible = False
+        title = panel_state.title_visual
+        title.text = opts.plotTitle or ""
+        title.height_min = title.height_max = 26 if opts.plotTitle else 0
+        self._update_streamlines(panel_state, frame)
 
         # Trigger a canvas redraw so the updated data is displayed
         self._canvas.update()
@@ -1170,6 +1393,7 @@ class VispyBackend(AbstractBackend):
     # Export
     # -------------------------------------------------------------------------
 
+    @_serialized_canvas
     def export(self, filepath: str, **kwargs: Any) -> None:
         """Export the canvas to *filepath*.
 
@@ -1192,6 +1416,8 @@ class VispyBackend(AbstractBackend):
         if self._canvas is None:
             raise RuntimeError("No canvas to export; call create_figure first.")
         img_array = self._canvas.render()
+        if self._refresh_axes():
+            img_array = self._canvas.render()
         dpi = kwargs.pop("dpi", None)
         # `background=True`: encode + write on a worker thread (PIL releases
         # the GIL while compressing) so a simulation's step loop does not wait
@@ -1200,7 +1426,10 @@ class VispyBackend(AbstractBackend):
         background = bool(kwargs.pop("background", False))
         try:
             import PIL.Image  # noqa: PLC0415
+
             img = PIL.Image.fromarray(img_array)
+            if _os.path.splitext(str(filepath))[1].lower() in (".jpg", ".jpeg"):
+                img = img.convert("RGB")
             save_kwargs = dict(kwargs)
             if dpi is not None:
                 save_kwargs.setdefault("dpi", (dpi, dpi))
@@ -1211,12 +1440,14 @@ class VispyBackend(AbstractBackend):
         except ImportError:
             # Pillow not available — fall back to vispy's built-in PNG writer
             from vispy.io import write_png  # noqa: PLC0415
+
             write_png(filepath, img_array)
 
     # -------------------------------------------------------------------------
     # Display
     # -------------------------------------------------------------------------
 
+    @_serialized_canvas
     def show(self) -> None:
         """Flush / display the canvas.
 
@@ -1269,10 +1500,14 @@ class VispyBackend(AbstractBackend):
             # Push the first frame synchronously so the widget shows content
             # immediately rather than displaying an empty placeholder.
             self._flush_notebook_frame()
+            # The browser reports the resulting logical/physical size through
+            # the RFB resize event. Fixed pixel width clips bars in narrow cells.
+            self._canvas._backend.css_width = "100%"
         if self._jupyter_mode == "image":
             self._flush_image_frame()
         self._shown = True
 
+    @_serialized_canvas
     def update_figure_title(self, title: Optional[str]) -> None:
         """Update figure title text for both canvas content and native window."""
         text = "" if title is None else str(title)
@@ -1310,49 +1545,102 @@ class VispyBackend(AbstractBackend):
         if self._shown and self._jupyter_mode == "notebook":
             self._flush_notebook_frame()
 
-    def update_domain(self, newDomain: Any) -> None:
-        """Update the domain for all panels.
+    @_serialized_canvas
+    def close(self):
+        if self._canvas is not None:
+            try:
+                self._canvas.close()
+            finally:
+                self._canvas_access.closed = True
+                self._canvas_access.redraw_pending = False
+                self._canvas_access.schedule_redraw = None
+            self._states.clear()
+            self._canvas = None
 
-        This is a best-effort update: if the new domain is incompatible with
-        the existing particle states (e.g. different dimensionality), the
-        update is skipped and a warning is logged.
-        """
-        from ..math import getBounds  # noqa: PLC0415
-        import vispy.scene.visuals as visuals  # noqa: PLC0415
+    @staticmethod
+    def _unlink_camera(camera):
+        # Vispy exposes link() but no unlink(). Remove both sides to release
+        # retired cameras when a panel changes between planar and 3D views.
+        for other in list(camera._linked_cameras):
+            other._linked_cameras.pop(camera, None)
+        camera._linked_cameras.clear()
 
-        try:
-            for panel_key, view in self._views.items():
-                print(f"Updating domain for panel '{panel_key}' to {newDomain}")
-                # Get the current panel state to access its options and particles
-                panel_state = getattr(self, "_views", {}).get(panel_key, None)
-                if panel_state is None:
-                    print(f"Warning: No panel state found for '{panel_key}'; skipping domain update.")
+    def _link_compatible_cameras(self):
+        if not (self._sharex or self._sharey):
+            return
+        groups = {}
+        for state in self._states.values():
+            camera = state.view.camera
+            group = state.cameraGroup
+            if group[0] == 3 and not (self._sharex and self._sharey):
+                continue  # Turntable cameras cannot link individual x/y limits.
+            if group in groups:
+                groups[group].link(
+                    camera,
+                    axis=(
+                        None
+                        if self._sharex and self._sharey
+                        else ("x" if self._sharex else "y")
+                    ),
+                )
+            else:
+                groups[group] = camera
+
+    def _refresh_axes(self):
+        # AxisWidget listens to the scene transform, but mosaic widget
+        # placement can settle after that signal. Refresh from the final
+        # transforms so later panels never retain startup coordinates.
+        changed = False
+        for state in self._states.values():
+            title = state.title_visual
+            height = 26 if state.options.plotTitle else 0
+            if state.options.plotTitle and state.options.plotTitleGap is not None:
+                # Preserve the public gap's fraction-of-domain-height units
+                # while reserving the title outside the data viewport.
+                rect = getattr(state.view.camera, "_real_rect", None)
+                if rect is not None and rect.height > 0:
+                    domain_height = float(state.domain.max[1] - state.domain.min[1])
+                    gap = (
+                        state.options.plotTitleGap
+                        * domain_height
+                        * state.view.size[1]
+                        / rect.height
+                    )
+                    height = 22 + max(0, round(gap))
+            if title.height_min != height:
+                title.height_min = title.height_max = height
+                changed = True
+        for axes in getattr(self, "_axisWidgets", {}).values():
+            for axis in axes:
+                if not axis.visible or axis._linked_view is None:
                     continue
+                before = tuple(axis.axis.domain)
+                axis._view_changed()
+                changed |= not np.allclose(before, axis.axis.domain)
+        return changed
 
-                # Check if the new domain is compatible with the existing particles
-                if newDomain.dim != panel_state.domain.dim:
-                    print(f"Warning: Incompatible domain dimension for panel '{panel_key}'; skipping domain update.")
-                    continue
+    def _update_streamlines(self, state, frame):
+        grid = frame.options.gridVisualization
+        if grid is None or not grid.streamLines:
+            if state.stream_visual is not None:
+                state.stream_visual.visible = False
+            return
+        from ..grid import mapFrameToGrid
+        from ..streamLines import streamlineSegments
+        from vispy.scene.visuals import Line
 
-                # Update the domain in the panel state
-                panel_state.domain = newDomain
-                print(f"Updated domain for panel '{panel_key}' to {newDomain}")
-
-                # Recompute bounds and update camera
-                _fit_camera_to_domain(view, newDomain)
-
-                # Trigger a canvas redraw so the updated domain is displayed
-                self._canvas.update()
-                
-
-            # if newDomain.dim == 2:
-                
-            #     line_pts = _domain_line_positions_2d(newDomain)
-            #     self.domain_lines = visuals.Line(
-            #         line_pts, color="blue", connect="strip", parent=view.scene
-            #     )
-        except Exception:
-            pass
+        gs, gq, n, extent = mapFrameToGrid(frame, frame.streamlineQuantity)
+        edges = streamlineSegments(gs, gq, n, extent).reshape(-1, 2)
+        pts = np.column_stack((edges, np.zeros(len(edges), dtype=np.float32)))
+        if state.stream_visual is None:
+            state.stream_visual = Line(
+                pts, color="black", connect="segments", parent=state.view.scene
+            )
+            state.stream_visual.order = 10
+            state.stream_visual.set_gl_state("translucent", depth_test=False)
+        else:
+            state.stream_visual.visible = True
+            state.stream_visual.set_data(pts)
 
     def _ensure_native_window_visible(self) -> None:
         """Best-effort native widget raise/activate for GUI backends."""
@@ -1380,7 +1668,9 @@ class VispyBackend(AbstractBackend):
                     in_any_screen = False
                     for s in screens:
                         sg = s.geometry()
-                        if sg.x() <= x < (sg.x() + sg.width()) and sg.y() <= y < (sg.y() + sg.height()):
+                        if sg.x() <= x < (sg.x() + sg.width()) and sg.y() <= y < (
+                            sg.y() + sg.height()
+                        ):
                             in_any_screen = True
                             break
                     if self._force_primary_window or not in_any_screen:
@@ -1400,6 +1690,7 @@ class VispyBackend(AbstractBackend):
         except Exception:
             pass
 
+    @_serialized_canvas
     def _flush_notebook_frame(self) -> None:
         """Push the current frame to the notebook widget synchronously.
 
@@ -1410,8 +1701,8 @@ class VispyBackend(AbstractBackend):
         after the second would be silently dropped.
 
         We bypass the throttle by calling ``get_frame()`` and
-        ``_rfb_send_frame()`` directly and resetting ``_frame_feedback`` to
-        pretend all previous frames were acknowledged before each call.  The
+        ``_rfb_send_frame()`` directly. Browser acknowledgments remain intact;
+        replacing them with a synthetic index breaks asynchronous RFB stats. The
         render and ZMQ send are fully synchronous; no asyncio is involved.
 
         On the very first call (before the browser has sent a resize event),
@@ -1420,44 +1711,39 @@ class VispyBackend(AbstractBackend):
         first frame is rendered at the correct resolution immediately after
         ``ip_display(canvas)`` is called.
         """
-        try:
-            backend = self._canvas._backend
-            if not (hasattr(backend, "get_frame") and hasattr(backend, "_rfb_send_frame")):
-                return
-            # Pre-set physical size if the browser hasn't sent a resize yet.
-            if getattr(backend, "_physical_size", (1, 1))[0] <= 1:
-                px_w, px_h = self._canvas_size
-                backend._physical_size = (px_w, px_h)
-                # Keep logical and canvas sizes in sync so the first resize
-                # event does not use a degenerate 1x1 viewbox layout.
-                if hasattr(backend, "_logical_size"):
-                    backend._logical_size = (px_w, px_h)
-                if hasattr(self._canvas, "size"):
-                    self._canvas.size = (px_w, px_h)
-                if hasattr(backend, "_helper"):
-                    backend._helper.set_physical_size(px_w, px_h)
-                if hasattr(backend, "_emit_resize_event"):
-                    backend._emit_resize_event()
+        backend = self._canvas._backend
+        if not (hasattr(backend, "get_frame") and hasattr(backend, "_rfb_send_frame")):
+            return
+        # Pre-set physical size if the browser hasn't sent a resize yet.
+        if getattr(backend, "_physical_size", (1, 1))[0] <= 1:
+            px_w, px_h = self._canvas_size
+            backend._physical_size = (px_w, px_h)
+            # Keep logical and canvas sizes in sync so the first resize
+            # event does not use a degenerate 1x1 viewbox layout.
+            if hasattr(backend, "_logical_size"):
+                backend._logical_size = (px_w, px_h)
+            if hasattr(self._canvas, "size"):
+                self._canvas.size = (px_w, px_h)
+            if hasattr(backend, "_helper"):
+                backend._helper.set_physical_size(px_w, px_h)
+            if hasattr(backend, "_emit_resize_event"):
+                backend._emit_resize_event()
 
-            # If any panel still has a zero-sized viewbox, defer this frame.
-            # A subsequent browser resize/layout event will provide valid
-            # geometry and normal drawing can proceed without singular matrices.
-            if any(
-                _view_rect_is_degenerate(v) or _camera_rect_is_degenerate(v)
-                for v in self._views.values()
-            ):
-                return
+        # If any panel still has a zero-sized viewbox, defer this frame.
+        # A subsequent browser resize/layout event will provide valid
+        # geometry and normal drawing can proceed without singular matrices.
+        if any(
+            _view_rect_is_degenerate(v) or _camera_rect_is_degenerate(v)
+            for v in self._views.values()
+        ):
+            return
 
-            # Pretend all in-flight frames were acknowledged so the throttle
-            # never blocks us.
-            backend._frame_feedback = {"index": backend._rfb_frame_index}
-            with backend._output_context:
-                array = backend.get_frame()
-                if array is not None:
-                    backend._rfb_send_frame(array)
-        except Exception:
-            pass
+        with backend._output_context:
+            array = backend.get_frame()
+            if array is not None:
+                backend._rfb_send_frame(array)
 
+    @_serialized_canvas
     def _flush_image_frame(self) -> None:
         """Render offscreen and push the frame as a static Jupyter image.
 
@@ -1476,6 +1762,8 @@ class VispyBackend(AbstractBackend):
             from IPython.display import display as ip_display  # noqa: PLC0415
 
             array = self._canvas.render()
+            if self._refresh_axes():
+                array = self._canvas.render()
             try:
                 import PIL.Image  # noqa: PLC0415
 
@@ -1491,8 +1779,8 @@ class VispyBackend(AbstractBackend):
                 self._image_display_handle = ip_display(image, display_id=True)
             else:
                 self._image_display_handle.update(image)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Vispy image rendering failed") from exc
 
     # -------------------------------------------------------------------------
     # Capability flags
@@ -1500,9 +1788,7 @@ class VispyBackend(AbstractBackend):
 
     @property
     def supports_streamlines(self) -> bool:
-        # TODO (Phase 4 follow-up): implement with vispy Line visuals + seed
-        # integration; leave False until that work lands.
-        return False
+        return True
 
     @property
     def supports_grid(self) -> bool:
@@ -1510,9 +1796,5 @@ class VispyBackend(AbstractBackend):
 
     @property
     def supports_notebook_inline(self) -> bool:
-        try:
-            import jupyter_rfb  # noqa: F401
-
-            return True
-        except ImportError:
-            return False
+        # Static image display works independently of jupyter_rfb.
+        return True

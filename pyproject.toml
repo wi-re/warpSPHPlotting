@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpSPHPlotting"
-version = "0.6.0"
-description = "GPU-accelerated SPH neighbor search and operators built with NVIDIA Warp and PyTorch"
+version = "0.6.1"
+description = "Stateful particle and SPH field visualization with Matplotlib, PyVista, and Vispy"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["sph", "warp", "pytorch", "fluid-simulation", "neighbor-search", "crksph"]
+keywords = ["sph", "warp", "pytorch", "fluid-simulation", "visualization", "plotting"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -22,7 +22,9 @@ classifiers = [
 dependencies = [
     "torch",
     "warp-lang",
-    "numpy"
+    "numpy",
+    "warpSPHCore>=0.6.0",
+    "matplotlib>=3.7"
 ]
 
 [project.optional-dependencies]
@@ -41,8 +43,7 @@ notebooks = [
 
 # ── PyVista / VTK backend ────────────────────────────────────────────────
 plot-pyvista = [
-    "pyvista",
-    "trame",         # optional but needed for trameview in notebooks
+    "pyvista[jupyter]", # Includes the matching notebook/trame adapter.
 ]
 
 # ── Vispy / OpenGL backend ───────────────────────────────────────────────
@@ -52,20 +53,16 @@ plot-vispy = [
 ]
 
 # ── Lightweight VTK file export (no pyvista/vispy required) ─────────────
-vtk-export = [
-    "pyevtk",
-]
+vtk-export = [] # XML writers are bundled; no graphics runtime is required.
 
 # ── Everything ───────────────────────────────────────────────────────────
 plot-all = [
     "matplotlib",
     "ipympl",
     "ipywidgets",
-    "pyvista",
-    "trame",
+    "pyvista[jupyter]",
     "vispy",
     "jupyter_rfb",
-    "pyevtk",
 ]
 
 dev = [

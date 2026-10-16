@@ -207,3 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 output/
+/output
+
+# Keep verification prose; generated evidence belongs in warpSPHDevelopment.
+/reports/*
+!/reports/*.md

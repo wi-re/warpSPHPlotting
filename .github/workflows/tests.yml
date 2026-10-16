@@ -1,0 +1,33 @@
+name: plotting
+on: [push, pull_request]
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python }}'
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e '.[dev]'
+      - run: MPLBACKEND=Agg pytest -q tests/test_correctness.py tests/test_3d_scaling.py
+  rendering:
+    runs-on: ubuntu-latest
+    env:
+      MPLBACKEND: Agg
+      EGL_PLATFORM: surfaceless
+      VTK_DEFAULT_OPENGL_WINDOW: vtkEGLRenderWindow
+      PYVISTA_OFF_SCREEN: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libopengl0 libegl-mesa0
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e '.[dev,plot-all]'
+      - run: python -c "import pyvista, vispy; from trame_pyvista.jupyter import show_trame"
+      - run: pytest -q tests
